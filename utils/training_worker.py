@@ -160,7 +160,7 @@ class TrainingWorker(QObject):
             
             # Create data.yaml file based on dataset format
             yaml_path = self._create_dataset_yaml()
-            
+
             # Check GPU availability
             device = self._check_gpu()
             self.log_update.emit(f"Using device: {device}")
@@ -596,7 +596,13 @@ class TrainingWorker(QObject):
                     'device': device,
                     'exist_ok': True,
                     'save_dir': self.output_dir,
-                    'plots': True
+                    'plots': True,
+                    # ================= 关键修复项 =================
+                    'deterministic': False,  # 强制关闭确定性算法，避免 CUDA cumsum 报错
+                    'workers': 0,  # 设为 0 (或 2)，避免 Windows 多进程共享内存冲突崩溃
+                    'verbose': False,  # 禁用终端详细刷屏输出，防止 PyQt stdout 管道溢出
+                    'plots': False,  # 调试期间先设为 False，避免训练结束画图时触发 OpenCV/Matplotlib GUI 冲突
+                    'amp': False  # 禁用混合精度测试
                 }
                 
                 # 根据不同的ultralytics版本，尝试不同的回调方式
@@ -647,14 +653,18 @@ class TrainingWorker(QObject):
                     # 方法2: 使用基于函数的回调方式
                     try:
                         self.log_update.emit("使用函数回调方式 (on_train_batch_end)")
+                        # 1. 挂载回调的标准方式（无需写复杂兼容逻辑）：
+                        model.add_callback("on_train_start", on_train_start_fn)
+                        model.add_callback("on_train_batch_end", on_train_batch_end_fn)
+                        model.add_callback("on_train_epoch_end", on_train_epoch_end_fn)
                         # 使用捕获器运行训练 - 函数回调方式
                         with stdout_capture:
                             # 使用函数回调进行训练
-                            train_args['callbacks'] = {
-                                'on_train_start': on_train_start_fn,
-                                'on_train_batch_end': on_train_batch_end_fn,
-                                'on_train_epoch_end': on_train_epoch_end_fn
-                            }
+                            # train_args['callbacks'] = {
+                            #     'on_train_start': on_train_start_fn,
+                            #     'on_train_batch_end': on_train_batch_end_fn,
+                            #     'on_train_epoch_end': on_train_epoch_end_fn
+                            # }
                             self.log_update.emit("开始训练，第一个epoch可能较慢，因为需要进行初始化和缓存")
                             results = model.train(**train_args)
                     except Exception as e:
@@ -689,6 +699,8 @@ class TrainingWorker(QObject):
                     if results is not None and hasattr(results, 'metrics'):
                         metrics = results.metrics
                         self.log_update.emit(f"训练完成! 最终结果:")
+
+
                         if hasattr(metrics, 'box_loss'):
                             self.log_update.emit(f"box_loss: {metrics.box_loss:.4f}")
                         if hasattr(metrics, 'cls_loss'):
@@ -697,6 +709,18 @@ class TrainingWorker(QObject):
                             self.log_update.emit(f"mAP50: {metrics.map50:.4f}")
                     
                     self.log_update.emit("训练成功完成!")
+                    # 2. 训练完成后，自动将模型导出为 ONNX 格式
+                    self.log_update.emit("训练完成，正在导出为 ONNX 格式...")
+
+                    # 导出 best.pt 为 ONNX
+                    onnx_path = model.export(
+                        format="onnx",
+                        imgsz=self.img_size,
+                        dynamic=False,  # 如果需要固定输入尺寸填 False；需要动态输入尺寸填 True
+                        simplify=True  # 自动优化 ONNX 结构
+                    )
+
+                    self.log_update.emit(f"ONNX 模型导出成功！路径为: {onnx_path}")
                     self.progress_update.emit(100)
                     self.training_complete.emit()
                 

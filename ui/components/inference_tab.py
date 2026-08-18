@@ -55,7 +55,7 @@ class InferenceTab(QWidget):
         # Model selection
         self.model_path_layout = QHBoxLayout()
         self.model_path_edit = QLineEdit()
-        self.model_path_edit.setReadOnly(True)
+        self.model_path_edit.setReadOnly(False)
         self.model_path_btn = QPushButton("浏览...")
         self.model_path_layout.addWidget(self.model_path_edit)
         self.model_path_layout.addWidget(self.model_path_btn)
@@ -104,7 +104,7 @@ class InferenceTab(QWidget):
         # Input selection
         self.input_layout = QHBoxLayout()
         self.input_edit = QLineEdit()
-        self.input_edit.setReadOnly(True)
+        self.input_edit.setReadOnly(False)
         self.input_btn = QPushButton("浏览...")
         self.input_layout.addWidget(self.input_edit)
         self.input_layout.addWidget(self.input_btn)
@@ -112,7 +112,7 @@ class InferenceTab(QWidget):
         # Output directory
         self.output_dir_layout = QHBoxLayout()
         self.output_dir_edit = QLineEdit()
-        self.output_dir_edit.setReadOnly(True)
+        self.output_dir_edit.setReadOnly(False)
         self.output_dir_btn = QPushButton("浏览...")
         self.output_dir_layout.addWidget(self.output_dir_edit)
         self.output_dir_layout.addWidget(self.output_dir_btn)

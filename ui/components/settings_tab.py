@@ -128,7 +128,7 @@ class SettingsTab(QWidget):
         # Training data path
         self.train_dir_layout = QHBoxLayout()
         self.train_dir_edit = QLineEdit(self.settings['default_train_dir'])
-        self.train_dir_edit.setReadOnly(True)
+        self.train_dir_edit.setReadOnly(False)
         self.train_dir_btn = QPushButton("浏览...")
         self.train_dir_layout.addWidget(self.train_dir_edit)
         self.train_dir_layout.addWidget(self.train_dir_btn)
@@ -136,7 +136,7 @@ class SettingsTab(QWidget):
         # Validation data path
         self.val_dir_layout = QHBoxLayout()
         self.val_dir_edit = QLineEdit(self.settings['default_val_dir'])
-        self.val_dir_edit.setReadOnly(True)
+        self.val_dir_edit.setReadOnly(False)
         self.val_dir_btn = QPushButton("浏览...")
         self.val_dir_layout.addWidget(self.val_dir_edit)
         self.val_dir_layout.addWidget(self.val_dir_btn)
@@ -144,7 +144,7 @@ class SettingsTab(QWidget):
         # Test data path
         self.test_dir_layout = QHBoxLayout()
         self.test_dir_edit = QLineEdit(self.settings['default_test_dir'])
-        self.test_dir_edit.setReadOnly(True)
+        self.test_dir_edit.setReadOnly(False)
         self.test_dir_btn = QPushButton("浏览...")
         self.test_dir_layout.addWidget(self.test_dir_edit)
         self.test_dir_layout.addWidget(self.test_dir_btn)
@@ -152,7 +152,7 @@ class SettingsTab(QWidget):
         # Output path
         self.output_dir_layout = QHBoxLayout()
         self.output_dir_edit = QLineEdit(self.settings['default_output_dir'])
-        self.output_dir_edit.setReadOnly(True)
+        self.output_dir_edit.setReadOnly(False)
         self.output_dir_btn = QPushButton("浏览...")
         self.output_dir_layout.addWidget(self.output_dir_edit)
         self.output_dir_layout.addWidget(self.output_dir_btn)
@@ -160,7 +160,7 @@ class SettingsTab(QWidget):
         # Training model path
         self.train_model_layout = QHBoxLayout()
         self.train_model_edit = QLineEdit(self.settings['default_train_model_path'])
-        self.train_model_edit.setReadOnly(True)
+        self.train_model_edit.setReadOnly(False)
         self.train_model_btn = QPushButton("浏览...")
         self.train_model_layout.addWidget(self.train_model_edit)
         self.train_model_layout.addWidget(self.train_model_btn)
@@ -168,7 +168,7 @@ class SettingsTab(QWidget):
         # Testing model path
         self.test_model_layout = QHBoxLayout()
         self.test_model_edit = QLineEdit(self.settings['default_test_model_path'])
-        self.test_model_edit.setReadOnly(True)
+        self.test_model_edit.setReadOnly(False)
         self.test_model_btn = QPushButton("浏览...")
         self.test_model_layout.addWidget(self.test_model_edit)
         self.test_model_layout.addWidget(self.test_model_btn)
@@ -176,7 +176,7 @@ class SettingsTab(QWidget):
         # 新增：默认训练图像目录
         self.default_train_images_layout = QHBoxLayout()
         self.default_train_images_edit = QLineEdit(self.settings.get('default_train_images_dir', ''))
-        self.default_train_images_edit.setReadOnly(True)
+        self.default_train_images_edit.setReadOnly(False)
         self.default_train_images_btn = QPushButton("浏览...")
         self.default_train_images_layout.addWidget(self.default_train_images_edit)
         self.default_train_images_layout.addWidget(self.default_train_images_btn)
@@ -185,7 +185,7 @@ class SettingsTab(QWidget):
         # 新增：默认训练标签目录
         self.default_train_labels_layout = QHBoxLayout()
         self.default_train_labels_edit = QLineEdit(self.settings.get('default_train_labels_dir', ''))
-        self.default_train_labels_edit.setReadOnly(True)
+        self.default_train_labels_edit.setReadOnly(False)
         self.default_train_labels_btn = QPushButton("浏览...")
         self.default_train_labels_layout.addWidget(self.default_train_labels_edit)
         self.default_train_labels_layout.addWidget(self.default_train_labels_btn)
@@ -203,7 +203,7 @@ class SettingsTab(QWidget):
         # 新增：默认验证标签目录
         self.default_val_labels_layout = QHBoxLayout()
         self.default_val_labels_edit = QLineEdit(self.settings.get('default_val_labels_dir', ''))
-        self.default_val_labels_edit.setReadOnly(True)
+        self.default_val_labels_edit.setReadOnly(False)
         self.default_val_labels_btn = QPushButton("浏览...")
         self.default_val_labels_layout.addWidget(self.default_val_labels_edit)
         self.default_val_labels_layout.addWidget(self.default_val_labels_btn)
@@ -212,7 +212,7 @@ class SettingsTab(QWidget):
         # 新增：默认测试图像目录
         self.default_test_images_layout = QHBoxLayout()
         self.default_test_images_edit = QLineEdit(self.settings.get('default_test_images_dir', ''))
-        self.default_test_images_edit.setReadOnly(True)
+        self.default_test_images_edit.setReadOnly(False)
         self.default_test_images_btn = QPushButton("浏览...")
         self.default_test_images_layout.addWidget(self.default_test_images_edit)
         self.default_test_images_layout.addWidget(self.default_test_images_btn)
@@ -221,7 +221,7 @@ class SettingsTab(QWidget):
         # 新增：默认测试标签目录
         self.default_test_labels_layout = QHBoxLayout()
         self.default_test_labels_edit = QLineEdit(self.settings.get('default_test_labels_dir', ''))
-        self.default_test_labels_edit.setReadOnly(True)
+        self.default_test_labels_edit.setReadOnly(False)
         self.default_test_labels_btn = QPushButton("浏览...")
         self.default_test_labels_layout.addWidget(self.default_test_labels_edit)
         self.default_test_labels_layout.addWidget(self.default_test_labels_btn)

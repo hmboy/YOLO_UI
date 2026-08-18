@@ -83,7 +83,7 @@ class TrainingTab(QWidget):
         # Training images and labels
         self.train_images_layout = QHBoxLayout()
         self.train_images_edit = QLineEdit()
-        self.train_images_edit.setReadOnly(True)
+        self.train_images_edit.setReadOnly(False)
         self.train_images_btn = QPushButton("浏览...")
         self.train_images_layout.addWidget(self.train_images_edit)
         self.train_images_layout.addWidget(self.train_images_btn)
@@ -91,7 +91,7 @@ class TrainingTab(QWidget):
 
         self.train_labels_layout = QHBoxLayout()
         self.train_labels_edit = QLineEdit()
-        self.train_labels_edit.setReadOnly(True)
+        self.train_labels_edit.setReadOnly(False)
         self.train_labels_btn = QPushButton("浏览...")
         self.train_labels_layout.addWidget(self.train_labels_edit)
         self.train_labels_layout.addWidget(self.train_labels_btn)
@@ -100,7 +100,7 @@ class TrainingTab(QWidget):
         # Validation images and labels
         self.val_images_layout = QHBoxLayout()
         self.val_images_edit = QLineEdit()
-        self.val_images_edit.setReadOnly(True)
+        self.val_images_edit.setReadOnly(False)
         self.val_images_btn = QPushButton("浏览...")
         self.val_images_layout.addWidget(self.val_images_edit)
         self.val_images_layout.addWidget(self.val_images_btn)
@@ -108,7 +108,7 @@ class TrainingTab(QWidget):
 
         self.val_labels_layout = QHBoxLayout()
         self.val_labels_edit = QLineEdit()
-        self.val_labels_edit.setReadOnly(True)
+        self.val_labels_edit.setReadOnly(False)
         self.val_labels_btn = QPushButton("浏览...")
         self.val_labels_layout.addWidget(self.val_labels_edit)
         self.val_labels_layout.addWidget(self.val_labels_btn)

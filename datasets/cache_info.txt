@@ -1,0 +1,2 @@
+F:/xwechat_files/wxid_5o0i1dauisnr22_6224/msg/file/2026-08/dataset/data/images/train
+F:/xwechat_files/wxid_5o0i1dauisnr22_6224/msg/file/2026-08/dataset/data/images/val
