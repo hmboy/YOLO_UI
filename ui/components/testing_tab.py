@@ -68,9 +68,12 @@ class TestingTab(QWidget):
         
         # Image size
         self.img_size_spin = QSpinBox()
-        self.img_size_spin.setRange(32, 1280)
+        self.img_size_spin.setRange(32, 8192)
         self.img_size_spin.setValue(640)
         self.img_size_spin.setSingleStep(32)
+        self.img_size_spin.setToolTip(
+            "推理/评估时的图像边长（建议为 32 的倍数）。大尺寸显存占用更高。"
+        )
         
         # Add widgets to form layout
         model_layout.addRow("模型路径:", self.model_path_layout)
@@ -86,7 +89,7 @@ class TestingTab(QWidget):
         # Directory selection
         self.test_images_layout = QHBoxLayout()
         self.test_images_edit = QLineEdit()
-        self.test_images_edit.setReadOnly(True)
+        self.test_images_edit.setReadOnly(False)
         self.test_images_btn = QPushButton("浏览...")
         self.test_images_layout.addWidget(self.test_images_edit)
         self.test_images_layout.addWidget(self.test_images_btn)
@@ -95,7 +98,7 @@ class TestingTab(QWidget):
         # 新增：测试标签目录
         self.test_labels_layout = QHBoxLayout()
         self.test_labels_edit = QLineEdit()
-        self.test_labels_edit.setReadOnly(True)
+        self.test_labels_edit.setReadOnly(False)
         self.test_labels_btn = QPushButton("浏览...")
         self.test_labels_layout.addWidget(self.test_labels_edit)
         self.test_labels_layout.addWidget(self.test_labels_btn)
@@ -189,7 +192,7 @@ class TestingTab(QWidget):
         image_header_layout.setContentsMargins(0, 0, 0, 5)  # 减小下边距
         
         image_title = QLabel("检测结果预览")
-        image_title.setFont(QFont("", 11, QFont.Bold))  # 增大字体
+        image_title.setFont(QFont("", 13, QFont.Bold))  # 增大字体
         image_header_layout.addWidget(image_title)
         
         # 添加保存按钮，样式更明显
@@ -227,7 +230,7 @@ class TestingTab(QWidget):
         terminal_header_layout.setContentsMargins(0, 0, 0, 5)  # 减小下边距
         
         terminal_title = QLabel("终端输出")
-        terminal_title.setFont(QFont("", 11, QFont.Bold))  # 增大字体
+        terminal_title.setFont(QFont("", 13, QFont.Bold))  # 增大字体
         terminal_header_layout.addWidget(terminal_title)
         
         # 添加清除按钮
@@ -303,19 +306,22 @@ class TestingTab(QWidget):
         dir_path = QFileDialog.getExistingDirectory(self, title)
         if dir_path:
             line_edit.setText(dir_path)
-            # 自动同步到设置页
-            from ui.main_window import MainWindow
-            main_window = self.parentWidget()
-            while main_window and not isinstance(main_window, MainWindow):
-                main_window = main_window.parentWidget()
-            if main_window and hasattr(main_window, 'settings_tab'):
-                settings_tab = main_window.settings_tab
-                if line_edit is self.test_images_edit:
-                    settings_tab.default_test_images_edit.setText(dir_path)
-                elif line_edit is self.test_labels_edit:
-                    settings_tab.default_test_labels_edit.setText(dir_path)
-                # 实时保存
-                settings_tab.save_settings()
+            settings_tab = self._find_settings_tab()
+            if settings_tab is None:
+                return
+            if line_edit is self.test_images_edit:
+                settings_tab.default_test_images_edit.setText(dir_path)
+            elif line_edit is self.test_labels_edit:
+                settings_tab.default_test_labels_edit.setText(dir_path)
+            settings_tab.save_settings(show_message=False)
+
+    def _find_settings_tab(self):
+        parent = self.parentWidget()
+        while parent is not None:
+            if hasattr(parent, 'settings_tab'):
+                return parent.settings_tab
+            parent = parent.parentWidget()
+        return None
     
     def start_testing(self):
         """Validate inputs and start testing in a separate thread."""
@@ -476,10 +482,20 @@ class TestingTab(QWidget):
                     summary_line = [line for line in lines if 'all' in line.lower()]
                     if summary_line:
                         stats = summary_line[0].split()
+                        # 格式: 类别 图片数 目标数 精确率 召回率 mAP50 mAP50-95
+                        if len(stats) >= 7:
+                            precision, recall = stats[3], stats[4]
+                            map50, map50_95 = stats[5], stats[6]
+                            self.stats_label.setText(
+                                f"精确率: {precision}\n召回率: {recall}\n"
+                                f"mAP@.5: {map50}\nmAP@.5:.95: {map50_95}"
+                            )
+                            return
                         if len(stats) >= 5:
-                            map50 = stats[3]  # mAP@.5
-                            map50_95 = stats[4]  # mAP@.5:.95
-                            self.stats_label.setText(f"mAP@.5: {map50}\nmAP@.5:.95: {map50_95}")
+                            # 兼容旧格式兜底
+                            self.stats_label.setText(
+                                f"mAP@.5: {stats[3]}\nmAP@.5:.95: {stats[4]}"
+                            )
                             return
                             
                 # 如果无法提取详细指标，至少显示已更新
@@ -565,10 +581,14 @@ class TestingTab(QWidget):
             self.img_size_spin.setValue(settings['default_img_size'])
         
         # Update default paths and set in UI if empty
-        if 'default_test_dir' in settings:
-            self.default_test_dir = settings['default_test_dir']
-            if self.default_test_dir and not self.test_images_edit.text():
-                self.test_images_edit.setText(self.default_test_dir)
+        test_images = settings.get('default_test_images_dir') or settings.get('default_test_dir', '')
+        if test_images and not self.test_images_edit.text():
+            self.test_images_edit.setText(test_images)
+            self.default_test_dir = test_images
+
+        test_labels = settings.get('default_test_labels_dir', '')
+        if test_labels and not self.test_labels_edit.text():
+            self.test_labels_edit.setText(test_labels)
         
         if 'default_output_dir' in settings:
             self.default_output_dir = settings['default_output_dir']

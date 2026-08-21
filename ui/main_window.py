@@ -14,6 +14,7 @@ from ui.components.testing_tab import TestingTab
 from ui.components.settings_tab import SettingsTab
 from ui.components.inference_tab import InferenceTab
 from ui.components.dataset_converter_tab import DatasetConverterTab
+from ui.components.annotation_tab import AnnotationTab
 from utils.terminal_redirect import TerminalManager
 from utils.theme_manager import ThemeManager
 
@@ -22,9 +23,20 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YOLO目标检测训练与测试工具 zweicumt@163.com")
-        self.setMinimumSize(1200, 900)  # 增加最小尺寸
-        self.resize(1400, 1000)  # 设置默认尺寸
+        self.setWindowTitle("YOLO目标检测训练与测试工具")
+        self.setMinimumSize(1400, 900)
+        # 按屏幕可用区域放大初始窗口（约 92%），并居中
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = max(1600, int(avail.width() * 0.92))
+            h = max(1000, int(avail.height() * 0.92))
+            self.resize(min(w, avail.width()), min(h, avail.height()))
+            frame = self.frameGeometry()
+            frame.moveCenter(avail.center())
+            self.move(frame.topLeft())
+        else:
+            self.resize(1680, 1050)
         
         # 设置应用图标
         self.set_app_icon()
@@ -54,13 +66,16 @@ class MainWindow(QMainWindow):
         self.testing_tab = TestingTab()
         self.inference_tab = InferenceTab()
         self.dataset_converter_tab = DatasetConverterTab()
+        self.annotation_tab = AnnotationTab()
         
-        # Add tabs to tab widget
+        # Add tabs to tab widget（缺陷标注为首页）
+        self.tab_widget.addTab(self.annotation_tab, "缺陷标注")
         self.tab_widget.addTab(self.training_tab, "训练")
         self.tab_widget.addTab(self.testing_tab, "测试")
         self.tab_widget.addTab(self.inference_tab, "推理")
         self.tab_widget.addTab(self.dataset_converter_tab, "数据集转换")
         self.tab_widget.addTab(self.settings_tab, "设置")
+        self.tab_widget.setCurrentIndex(0)
         
         # 为标签页添加图标
         self.setup_tab_icons()
@@ -139,14 +154,16 @@ class MainWindow(QMainWindow):
             train_icon = self.create_icon_from_svg(os.path.join(assets_dir, "train_icon.svg"))
             test_icon = self.create_icon_from_svg(os.path.join(assets_dir, "test_icon.svg"))
             inference_icon = self.create_icon_from_svg(os.path.join(assets_dir, "inference_icon.svg"))
+            annotation_icon = self.create_icon_from_svg(os.path.join(assets_dir, "annotation_icon.svg"))
             settings_icon = self.create_icon_from_svg(os.path.join(assets_dir, "settings_icon.svg"))
             converter_icon = self.create_icon_from_svg(os.path.join(assets_dir, "converter_icon.svg"))
             
-            self.tab_widget.setTabIcon(0, train_icon)
-            self.tab_widget.setTabIcon(1, test_icon)
-            self.tab_widget.setTabIcon(2, inference_icon)
-            self.tab_widget.setTabIcon(3, converter_icon)
-            self.tab_widget.setTabIcon(4, settings_icon)
+            self.tab_widget.setTabIcon(0, annotation_icon)
+            self.tab_widget.setTabIcon(1, train_icon)
+            self.tab_widget.setTabIcon(2, test_icon)
+            self.tab_widget.setTabIcon(3, inference_icon)
+            self.tab_widget.setTabIcon(4, converter_icon)
+            self.tab_widget.setTabIcon(5, settings_icon)
         except Exception as e:
             print(f"设置标签页图标时出错: {str(e)}")
     
@@ -156,6 +173,7 @@ class MainWindow(QMainWindow):
         self.settings_tab.settings_updated.connect(self.training_tab.update_settings)
         self.settings_tab.settings_updated.connect(self.testing_tab.update_settings)
         self.settings_tab.settings_updated.connect(self.inference_tab.update_settings)
+        self.settings_tab.settings_updated.connect(self.annotation_tab.update_settings)
         
         # 连接主题变更信号
         self.settings_tab.theme_changed.connect(self.on_theme_changed)
@@ -185,7 +203,7 @@ class MainWindow(QMainWindow):
     def setup_styling(self):
         """Apply styling to the UI elements"""
         # Set the font for the entire application
-        font = QFont("Segoe UI", 10)
+        font = QFont("Segoe UI", 13)
         self.setFont(font)
         
         # Set style for tab widget
@@ -194,7 +212,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.setMovable(True)
         
         # 增加标签页的图标大小
-        self.tab_widget.setIconSize(QSize(24, 24))  # 稍微增大图标以便更好地显示SVG
+        self.tab_widget.setIconSize(QSize(28, 28))
     
     def setup_terminal_redirection(self):
         """Set up terminal output redirection to the UI."""
@@ -210,7 +228,9 @@ class MainWindow(QMainWindow):
             
             # Connect to dataset converter tab's log text area
             self.terminal_manager.connect_to_text_edit(self.dataset_converter_tab.log_text)
-            
+
+            # 缺陷标注页使用自己的 log()，不接入终端重定向，避免 stdout 刷屏/重复
+
             # Start redirection
             self.terminal_manager.start_redirection()
             print("终端输出重定向已初始化")
@@ -227,23 +247,37 @@ class MainWindow(QMainWindow):
         pass
     
     def closeEvent(self, event):
-        """Handle close event - ask for confirmation if training/testing is in progress"""
-        if (hasattr(self.training_tab, 'is_training') and self.training_tab.is_training) or \
-           (hasattr(self.testing_tab, 'is_testing') and self.testing_tab.is_testing) or \
-           (hasattr(self.inference_tab, 'is_inferencing') and self.inference_tab.is_inferencing):
+        """Handle close event - ask for confirmation if work is in progress"""
+        busy = (
+            (hasattr(self.training_tab, 'is_training') and self.training_tab.is_training) or
+            (hasattr(self.testing_tab, 'is_testing') and self.testing_tab.is_testing) or
+            (hasattr(self.inference_tab, 'is_inferencing') and self.inference_tab.is_inferencing) or
+            (hasattr(self.annotation_tab, 'is_training') and self.annotation_tab.is_training) or
+            (hasattr(self.annotation_tab, 'is_detecting') and self.annotation_tab.is_detecting)
+        )
+        unsaved = (
+            hasattr(self.annotation_tab, 'has_unsaved_changes') and
+            self.annotation_tab.has_unsaved_changes()
+        )
+
+        if busy or unsaved:
+            if busy and unsaved:
+                message = "有进程正在运行，且标注尚未保存。确定要退出吗？"
+            elif busy:
+                message = "有进程正在运行。确定要退出吗？"
+            else:
+                message = "标注有未保存更改。确定要退出吗？"
             reply = QMessageBox.question(
                 self, '确认退出',
-                "有进程正在运行。确定要退出吗？",
+                message,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if reply == QMessageBox.Yes:
-                # Stop terminal redirection before closing
                 self.terminal_manager.stop_redirection()
                 event.accept()
             else:
                 event.ignore()
         else:
-            # Stop terminal redirection before closing
             self.terminal_manager.stop_redirection()
             event.accept()
     
@@ -257,6 +291,13 @@ class MainWindow(QMainWindow):
             self.training_tab.update_settings(settings)
             self.testing_tab.update_settings(settings)
             self.inference_tab.update_settings(settings)
+            self.annotation_tab.update_settings(settings)
+
+            # 启动时自动打开上次缺陷标注项目
+            try:
+                self.annotation_tab.restore_last_project()
+            except Exception as restore_err:
+                print(f"自动打开上次项目失败: {restore_err}")
             
             print("默认设置已加载。")
         except Exception as e:

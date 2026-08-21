@@ -5,6 +5,8 @@ import threading
 import torch
 from PyQt5.QtCore import QObject, pyqtSignal
 
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+
 class TrainingWorker(QObject):
     """Worker class to handle YOLO model training in a separate thread."""
     
@@ -12,10 +14,16 @@ class TrainingWorker(QObject):
     progress_update = pyqtSignal(int)
     log_update = pyqtSignal(str)
     training_complete = pyqtSignal()
+    training_stopped = pyqtSignal()
     training_error = pyqtSignal(str)
-    
+    best_weights_ready = pyqtSignal(str)  # 训练成功后发出 best.pt 路径
+
     def __init__(self, model_type, train_dir, val_dir, output_dir, project_name,
-                 dataset_format, batch_size, epochs, img_size, learning_rate, pretrained, model_weights=None, fine_tuning=False):
+                 dataset_format, batch_size, epochs, img_size, learning_rate, pretrained,
+                 model_weights=None, fine_tuning=False,
+                 train_labels_dir=None, val_labels_dir=None,
+                 use_gpu=True, gpu_device=0, export_onnx=True,
+                 roi_enabled=False, roi_norm=None):
         """
         Initialize the training worker with parameters.
         
@@ -33,6 +41,9 @@ class TrainingWorker(QObject):
             pretrained (bool): Whether to use pretrained weights
             model_weights (str, optional): Path to custom model weights for initialization
             fine_tuning (bool): Whether to freeze backbone layers and only train detection head
+            export_onnx (bool): Whether to export ONNX after training
+            roi_enabled (bool): Whether to crop all images with a global ROI before training
+            roi_norm (tuple|list|None): Normalized ROI (x1, y1, x2, y2) in 0-1
         """
         super().__init__()
         self.model_type = model_type
@@ -48,7 +59,17 @@ class TrainingWorker(QObject):
         self.pretrained = pretrained
         self.model_weights = model_weights
         self.fine_tuning = fine_tuning
-        
+        self.train_labels_dir = train_labels_dir or ''
+        self.val_labels_dir = val_labels_dir or ''
+        self.use_gpu = use_gpu
+        self.gpu_device = gpu_device
+        self.export_onnx = export_onnx
+        self.roi_enabled = bool(roi_enabled)
+        if roi_norm and len(roi_norm) == 4:
+            self.roi_norm = tuple(float(v) for v in roi_norm)
+        else:
+            self.roi_norm = (0.0, 0.0, 1.0, 1.0)
+
         self._stop_event = threading.Event()
         self._trainer_ref = None  # Reference to the trainer object for direct access
         self._process_ref = None  # Reference to any training process that might be running
@@ -85,18 +106,24 @@ class TrainingWorker(QObject):
                 pass
         
         return False
-    
+
+    def _is_valid_weights_file(self, path: str) -> bool:
+        """检查 .pt 权重文件是否有效（排除占位文本文件）。"""
+        try:
+            return os.path.isfile(path) and os.path.getsize(path) >= 1024
+        except OSError:
+            return False
+
     def run(self):
         """Run the training process."""
         try:
             self.log_update.emit(f"Starting training with {self.model_type}")
-            print(f"Starting training with {self.model_type}")
             self.log_update.emit(f"Dataset format: {self.dataset_format}")
-            print(f"Dataset format: {self.dataset_format}")
             self.log_update.emit(f"Batch size: {self.batch_size}, Image size: {self.img_size}")
-            print(f"Batch size: {self.batch_size}, Image size: {self.img_size}")
             self.log_update.emit(f"Learning rate: {self.learning_rate}, Epochs: {self.epochs}")
-            print(f"Learning rate: {self.learning_rate}, Epochs: {self.epochs}")
+            if self.roi_enabled and not self._roi_is_full_frame():
+                x1, y1, x2, y2 = self.roi_norm
+                self.log_update.emit(f"Global ROI: ({x1:.4f}, {y1:.4f}) -> ({x2:.4f}, {y2:.4f})")
             
             # Check internet connectivity for model downloading
             has_internet = self._check_internet_connection()
@@ -128,7 +155,7 @@ class TrainingWorker(QObject):
                 
                 # Look for model file in possible locations
                 for location in possible_locations:
-                    if os.path.exists(location):
+                    if self._is_valid_weights_file(location):
                         self.log_update.emit(f"找到本地模型权重: {location}")
                         # Copy to cache if not already there
                         if location != model_file:
@@ -146,20 +173,13 @@ class TrainingWorker(QObject):
                 if not model_found:
                     self.log_update.emit(f"本地未找到模型文件 {self.model_type}.pt，将尝试自动下载")
                     self.model_weights = None
-                
-                    # Try to create a placeholder for the download target
-                    # This will allow the YOLO loader to download directly to our cache
-                    try:
-                        # Create an empty file to mark the download location
-                        with open(model_file, 'w') as f:
-                            f.write("# Placeholder for model download\n")
-                        self.log_update.emit(f"已准备下载位置: {model_file}")
-                        # We don't set model_weights yet - let YOLO handle the download
-                    except Exception as e:
-                        self.log_update.emit(f"准备下载位置失败: {str(e)}")
             
+            # 全局 ROI：训练前物化裁剪数据集，并对标签坐标重映射
+            self._apply_global_roi_if_needed()
+
             # Create data.yaml file based on dataset format
             yaml_path = self._create_dataset_yaml()
+            self._ensure_dataset_ready(yaml_path)
 
             # Check GPU availability
             device = self._check_gpu()
@@ -190,6 +210,10 @@ class TrainingWorker(QObject):
             
             # Initialize the model
             try:
+                model_task = 'segment' if '-seg' in self.model_type.lower() else (
+                    'obb' if '-obb' in self.model_type.lower() else 'detect'
+                )
+
                 if self.model_weights:
                     # Use specified model weights
                     self.log_update.emit(f"正在加载指定模型权重: {self.model_weights}")
@@ -197,14 +221,14 @@ class TrainingWorker(QObject):
                     self.log_update.emit(f"成功加载模型权重: {self.model_weights}")
                 elif self.pretrained:
                     # Use pretrained weights
-                    self.log_update.emit(f"正在加载预训练权重: {self.model_type}")
+                    self.log_update.emit(f"正在加载预训练权重: {self.model_type} (task={model_task})")
                     
                     # Check if it's a YOLO12 model
                     if 'yolo12' in self.model_type.lower():
                         self.log_update.emit(f"检测到YOLO12模型类型: {self.model_type}")
                         try:
                             # For YOLO12, need to specify the correct task
-                            model = YOLO(f"{self.model_type}.pt", task='detect')
+                            model = YOLO(f"{self.model_type}.pt", task=model_task)
                             self.log_update.emit(f"成功加载预训练YOLO12模型: {self.model_type}")
                         except Exception as e:
                             error = str(e)
@@ -214,16 +238,16 @@ class TrainingWorker(QObject):
                             if "not online" in error.lower() or "download failure" in error.lower():
                                 self.log_update.emit("检测到网络连接问题，尝试从头开始训练模型")
                                 # Fall back to training from scratch
-                                model = YOLO(f"{self.model_type}.yaml", task='detect')
+                                model = YOLO(f"{self.model_type}.yaml", task=model_task)
                                 self.log_update.emit(f"已从头初始化YOLO12模型: {self.model_type}")
                             else:
                                 # Re-raise the exception if it's not a network issue
                                 raise
                     else:
-                        # Handle YOLOv5/YOLOv8 models
+                        # Handle YOLOv5/YOLOv8/YOLO11 models
                         try:
                             # Standard model loading
-                            model = YOLO(f"{self.model_type}.pt")
+                            model = YOLO(f"{self.model_type}.pt", task=model_task)
                             self.log_update.emit(f"成功加载预训练模型: {self.model_type}")
                         except Exception as e:
                             error = str(e)
@@ -233,14 +257,14 @@ class TrainingWorker(QObject):
                             if "not online" in error.lower() or "download failure" in error.lower():
                                 self.log_update.emit("检测到网络连接问题，尝试从头开始训练模型")
                                 # Fall back to training from scratch
-                                model = YOLO(f"{self.model_type}.yaml")
+                                model = YOLO(f"{self.model_type}.yaml", task=model_task)
                                 self.log_update.emit(f"已从头初始化模型: {self.model_type}")
                             else:
                                 # Re-raise the exception if it's not a network issue
                                 raise
                 else:
                     # For training from scratch, use the yaml file of the model architecture
-                    self.log_update.emit(f"将从头开始训练模型: {self.model_type}")
+                    self.log_update.emit(f"将从头开始训练模型: {self.model_type} (task={model_task})")
                     
                     # Check for model YAML file in multiple locations
                     yaml_found = False
@@ -263,21 +287,11 @@ class TrainingWorker(QObject):
                             break
                     
                     try:
-                        if 'yolo12' in self.model_type.lower():
-                            # YOLO12 requires a different YAML path format
-                            # Use found YAML file or rely on Ultralytics default paths
-                            if yaml_found:
-                                model = YOLO(yaml_file, task='detect')
-                            else:
-                                model = YOLO(f"{self.model_type}.yaml", task='detect')
-                            self.log_update.emit(f"已从头初始化YOLO12模型: {self.model_type}")
+                        if yaml_found:
+                            model = YOLO(yaml_file, task=model_task)
                         else:
-                            # Standard YOLO model
-                            if yaml_found:
-                                model = YOLO(yaml_file)
-                            else:
-                                model = YOLO(f"{self.model_type}.yaml")
-                            self.log_update.emit(f"已从头初始化模型: {self.model_type}")
+                            model = YOLO(f"{self.model_type}.yaml", task=model_task)
+                        self.log_update.emit(f"已从头初始化模型: {self.model_type}")
                     except Exception as e:
                         error = str(e)
                         self.log_update.emit(f"加载模型配置文件失败: {error}")
@@ -288,31 +302,32 @@ class TrainingWorker(QObject):
                             fallback_model = None
                             
                             # Map model types to fallbacks
-                            if self.model_type.endswith("n"):
-                                fallback_model = "yolov8n"
-                            elif self.model_type.endswith("s"):
-                                fallback_model = "yolov8s"
-                            elif self.model_type.endswith("m"):
-                                fallback_model = "yolov8m"
-                            elif self.model_type.endswith("l"):
-                                fallback_model = "yolov8l"
-                            elif self.model_type.endswith("x"):
-                                fallback_model = "yolov8x"
+                            if self.model_type.endswith("n") or self.model_type.endswith("n-seg"):
+                                fallback_model = "yolo11n-seg" if model_task == 'segment' else "yolov8n"
+                            elif self.model_type.endswith("s") or self.model_type.endswith("s-seg"):
+                                fallback_model = "yolo11s-seg" if model_task == 'segment' else "yolov8s"
+                            elif self.model_type.endswith("m") or self.model_type.endswith("m-seg"):
+                                fallback_model = "yolo11m-seg" if model_task == 'segment' else "yolov8m"
+                            elif self.model_type.endswith("l") or self.model_type.endswith("l-seg"):
+                                fallback_model = "yolo11l-seg" if model_task == 'segment' else "yolov8l"
+                            elif self.model_type.endswith("x") or self.model_type.endswith("x-seg"):
+                                fallback_model = "yolo11x-seg" if model_task == 'segment' else "yolov8x"
                             
                             if fallback_model:
                                 self.log_update.emit(f"尝试使用替代模型架构: {fallback_model}")
-                                model = YOLO(f"{fallback_model}.yaml")
+                                model = YOLO(f"{fallback_model}.yaml", task=model_task)
                                 self.log_update.emit(f"已使用替代模型架构: {fallback_model}")
                             else:
                                 # Last resort fallback
-                                self.log_update.emit("使用标准YOLOv8n架构作为后备方案")
-                                model = YOLO("yolov8n.yaml")
+                                fb = "yolo11m-seg.yaml" if model_task == 'segment' else "yolov8n.yaml"
+                                self.log_update.emit(f"使用标准架构作为后备方案: {fb}")
+                                model = YOLO(fb, task=model_task)
                         else:
                             # Re-raise if not a missing file issue
                             raise
                 
                 # Log model information
-                task_name = getattr(model, 'task', 'detect')
+                task_name = getattr(model, 'task', model_task)
                 self.log_update.emit(f"模型任务类型: {task_name}")
                 
                 # Apply fine-tuning mode if requested
@@ -398,151 +413,138 @@ class TrainingWorker(QObject):
             
             # Start training
             try:
-                # 创建保存指标的目录
-                metrics_dir = os.path.join(self.output_dir, self.project_name)
-                
-                # 设置进度更新的监控线程
+                run_name = time.strftime("%Y%m%d-%H%M%S")
+                self.run_stamp = run_name
+                self.effective_run_name = self._make_run_name(run_name)
+                metrics_root = os.path.join(self.output_dir, self.effective_run_name)
+                self.log_update.emit(f"本次训练输出目录: {metrics_root}")
+
                 stop_flag = threading.Event()
-                
+
+                def find_metrics_file():
+                    # 只读本次 run 目录，避免扫到历史 results.csv
+                    csv_path = os.path.join(metrics_root, 'results.csv')
+                    if os.path.isfile(csv_path):
+                        return csv_path
+                    return None
+
+                def _format_epoch_line(metrics: dict) -> str:
+                    try:
+                        ep = int(float(metrics.get('epoch', 0)))
+                        if ep < 1:
+                            ep = 1
+                    except (TypeError, ValueError):
+                        ep = '?'
+                    parts = [f'Epoch {ep}/{self.epochs}']
+                    for key, short in (
+                        ('train/box_loss', 'box'),
+                        ('train/cls_loss', 'cls'),
+                        ('train/dfl_loss', 'dfl'),
+                        ('metrics/precision(B)', 'P'),
+                        ('metrics/recall(B)', 'R'),
+                        ('metrics/mAP50(B)', 'mAP50'),
+                        ('metrics/mAP50-95(B)', 'mAP50-95'),
+                        ('metrics/precision', 'P'),
+                        ('metrics/recall', 'R'),
+                        ('metrics/mAP50', 'mAP50'),
+                        ('metrics/mAP50-95', 'mAP50-95'),
+                    ):
+                        if key not in metrics:
+                            continue
+                        try:
+                            parts.append(f'{short}={float(metrics[key]):.3f}')
+                        except (TypeError, ValueError):
+                            pass
+                    seen = set()
+                    uniq = []
+                    for p in parts:
+                        k = p.split('=', 1)[0]
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        uniq.append(p)
+                    return ' | '.join(uniq)
+
                 def progress_monitor():
-                    last_metrics_time = 0
+                    self.progress_update.emit(0)
                     metrics_file = None
-                    
-                    # 寻找可能的指标文件路径
-                    def find_metrics_file():
-                        # 检查最近创建的run目录
-                        run_dirs = []
-                        if os.path.exists(metrics_dir):
-                            for d in os.listdir(metrics_dir):
-                                full_path = os.path.join(metrics_dir, d)
-                                if os.path.isdir(full_path) and d.startswith("exp") or d.startswith("train"):
-                                    run_dirs.append((os.path.getmtime(full_path), full_path))
-                        
-                        # 按修改时间排序，获取最新的目录
-                        if run_dirs:
-                            latest_dir = sorted(run_dirs, reverse=True)[0][1]
-                            # 检查CSV文件
-                            csv_path = os.path.join(latest_dir, "results.csv")
-                            if os.path.exists(csv_path):
-                                return csv_path
-                        return None
-                    
-                    # 初始进度更新 - 不再使用固定延迟
-                    self.progress_update.emit(5)
-                    self.log_update.emit("加载和准备环境...")
-                    
-                    # 主循环监控训练进度
+                    last_metrics_time = 0
+                    last_emitted_epoch = -1
+                    train_started_at = time.time()
+
                     while not stop_flag.is_set() and not self._stop_event.is_set():
-                        # 尝试找到指标文件
                         if metrics_file is None:
-                            metrics_file = find_metrics_file()
-                        
-                        # 如果找到了指标文件，读取并显示最新指标
+                            cand = find_metrics_file()
+                            if cand and os.path.getmtime(cand) >= train_started_at - 1:
+                                metrics_file = cand
+
                         if metrics_file and os.path.exists(metrics_file):
                             current_time = os.path.getmtime(metrics_file)
-                            
-                            # 只有当文件更新时才读取
                             if current_time > last_metrics_time:
                                 last_metrics_time = current_time
                                 try:
-                                    with open(metrics_file, 'r') as f:
+                                    with open(metrics_file, 'r', encoding='utf-8', errors='ignore') as f:
                                         lines = f.readlines()
-                                        if len(lines) > 1:  # 至少有标题行和一行数据
-                                            last_line = lines[-1].strip()
-                                            header = lines[0].strip().split(',')
-                                            values = last_line.split(',')
-                                            
-                                            # 解析指标
-                                            metrics = {}
-                                            for i, key in enumerate(header):
-                                                if i < len(values):
-                                                    try:
-                                                        metrics[key] = float(values[i])
-                                                    except ValueError:
-                                                        metrics[key] = values[i]
-                                            
-                                            # 更新进度
-                                            if 'epoch' in metrics and 'epochs' in metrics:
-                                                epoch = metrics['epoch']
-                                                epochs = metrics['epochs']
-                                                progress = int((epoch / epochs) * 100)
-                                                self.progress_update.emit(progress)
-                                            
-                                            # 组织指标信息
-                                            info_text = f"Epoch: {metrics.get('epoch', '?')}/{metrics.get('epochs', '?')}\n"
-                                            
-                                            # 添加损失指标
-                                            losses = ["train/box_loss", "train/cls_loss", "train/dfl_loss", "val/box_loss", "val/cls_loss", "val/dfl_loss"]
-                                            info_text += "损失指标:\n"
-                                            for loss in losses:
-                                                if loss in metrics:
-                                                    info_text += f"  {loss}: {metrics[loss]:.4f}\n"
-                                            
-                                            # 添加精度指标
-                                            accuracies = ["metrics/precision", "metrics/recall", "metrics/mAP50", "metrics/mAP50-95"]
-                                            info_text += "精度指标:\n"
-                                            for acc in accuracies:
-                                                if acc in metrics:
-                                                    info_text += f"  {acc}: {metrics[acc]:.4f}\n"
-                                            
-                                            # 输出完整信息
-                                            self.log_update.emit(info_text)
-                                            print(info_text)  # Direct stdout output
+                                    if len(lines) > 1:
+                                        header = [h.strip() for h in lines[0].strip().split(',')]
+                                        values = lines[-1].strip().split(',')
+                                        metrics = {}
+                                        for i, key in enumerate(header):
+                                            if i < len(values):
+                                                try:
+                                                    metrics[key] = float(values[i])
+                                                except ValueError:
+                                                    metrics[key] = values[i]
+                                        if 'epoch' in metrics:
+                                            try:
+                                                epoch = int(float(metrics['epoch']))
+                                                if epoch < 1:
+                                                    epoch = 1
+                                                elif epoch > self.epochs:
+                                                    epoch = self.epochs
+                                                if epoch != last_emitted_epoch:
+                                                    last_emitted_epoch = epoch
+                                                    self.progress_update.emit(epoch)
+                                                    self.log_update.emit(_format_epoch_line(metrics))
+                                            except (TypeError, ValueError):
+                                                pass
                                 except Exception as e:
-                                    error_msg = f"读取指标文件出错: {str(e)}"
-                                    self.log_update.emit(error_msg)
-                                    print(error_msg, file=sys.stderr)  # Direct stderr output
-                        
-                        # 休眠时间缩短，更快地检查更新
-                        time.sleep(0.5)
-                
-                # 记录开始时间
+                                    self.log_update.emit(f"读取指标文件出错: {str(e)}")
+                        time.sleep(1.0)
+
                 start_time = time.time()
-                
-                # 启动监控线程
                 self.log_update.emit("启动进度监控...")
                 monitor_thread = threading.Thread(target=progress_monitor)
                 monitor_thread.daemon = True
                 monitor_thread.start()
-                
-                # 尝试设置自定义stdout捕获类，以便更实时地获取训练输出
+
                 class StdoutCapture:
+                    """透传 stdout 到原始终端；不再二次写入 UI（避免刷屏/重复）。"""
+
                     def __init__(self, worker):
                         self.worker = worker
                         self.original_stdout = sys.stdout
-                        self.original_stderr = sys.stderr
-                        self.buffer = ""
 
                     def write(self, text):
-                        # 写入原始流
-                        self.original_stdout.write(text)
-                        self.original_stdout.flush()
-                        
-                        # 添加到缓冲区
-                        self.buffer += text
-                        
-                        # 如果有完整行，则发送到UI
-                        if '\n' in text:
-                            lines = self.buffer.split('\n')
-                            for line in lines[:-1]:  # 处理除最后一个可能不完整的行外的所有行
-                                if line.strip():  # 如果行不为空
-                                    # 只处理训练相关信息
-                                    if "Epoch" in line and ("GPU_mem" in line or "box_loss" in line):
-                                        self.worker.log_update.emit(line)
-                            
-                            # 保留最后一个不完整的行
-                            self.buffer = lines[-1] if lines else ""
-                    
+                        try:
+                            self.original_stdout.write(text)
+                            self.original_stdout.flush()
+                        except Exception:
+                            pass
+
                     def flush(self):
-                        self.original_stdout.flush()
-                        
+                        try:
+                            self.original_stdout.flush()
+                        except Exception:
+                            pass
+
                     def __enter__(self):
                         sys.stdout = self
                         return self
-                    
+
                     def __exit__(self, exc_type, exc_val, exc_tb):
                         sys.stdout = self.original_stdout
-                        
+
                 # 创建捕获实例
                 stdout_capture = StdoutCapture(self)
                 
@@ -565,169 +567,108 @@ class TrainingWorker(QObject):
                     return True
                 
                 def on_train_epoch_end_fn(trainer=None):
-                    # 在每个epoch结束时检查停止标志
+                    # 每个 epoch 结束时更新进度（当前轮 / 总轮数）
+                    try:
+                        if trainer is not None and hasattr(trainer, 'epoch'):
+                            # trainer.epoch 为 0-based
+                            current = int(trainer.epoch) + 1
+                        else:
+                            current = 0
+                        total = int(getattr(trainer, 'epochs', self.epochs) if trainer else self.epochs)
+                        current = max(0, min(current, total or self.epochs))
+                        self.progress_update.emit(current)
+                    except Exception:
+                        pass
+
                     if self._stop_event.is_set():
                         self.log_update.emit("检测到停止信号，正在中断训练...")
                         if trainer:
-                            self._trainer_ref = trainer  # Store reference to trainer
+                            self._trainer_ref = trainer
                             if hasattr(trainer, 'stop'):
                                 trainer.stop = True
-                        return False  # 返回False以停止训练循环
+                        return False
                     return True
                 
                 # 添加新的回调函数，用于设置进程参考
                 def on_train_start_fn(trainer=None):
                     if trainer:
                         self._trainer_ref = trainer  # Store reference to trainer
-                        self.log_update.emit("训练开始，已捕获训练器引用")
+                        self.log_update.emit("训练开始")
+                    self.progress_update.emit(0)
                     import threading
                     self._process_ref = threading.current_thread()
                     return True
                 
-                # 创建带有回调的自定义训练参数
                 train_args = {
                     'data': yaml_path,
                     'epochs': self.epochs,
                     'batch': self.batch_size,
                     'imgsz': self.img_size,
-                    'project': self.project_name,
-                    'name': time.strftime("%Y%m%d-%H%M%S"),
+                    'project': self.output_dir,
+                    'name': self.effective_run_name,
                     'lr0': self.learning_rate,
                     'device': device,
                     'exist_ok': True,
-                    'save_dir': self.output_dir,
-                    'plots': True,
-                    # ================= 关键修复项 =================
-                    'deterministic': False,  # 强制关闭确定性算法，避免 CUDA cumsum 报错
-                    'workers': 0,  # 设为 0 (或 2)，避免 Windows 多进程共享内存冲突崩溃
-                    'verbose': False,  # 禁用终端详细刷屏输出，防止 PyQt stdout 管道溢出
-                    'plots': False,  # 调试期间先设为 False，避免训练结束画图时触发 OpenCV/Matplotlib GUI 冲突
-                    'amp': False  # 禁用混合精度测试
+                    'deterministic': False,
+                    'workers': 0,
+                    'verbose': False,
+                    'plots': False,
+                    'amp': True,
+                    'rect': True,
+                    # 关闭早停：默认 patience=100 会在指标不提升时提前结束
+                    'patience': 0,
                 }
-                
-                # 根据不同的ultralytics版本，尝试不同的回调方式
+
                 self.log_update.emit("配置训练参数和回调...")
-                
-                results = None
-                
-                # 使用不同的回调方法尝试训练
-                if has_callback_class:
-                    # 方法1: 使用基于类的回调方式
-                    try:
-                        self.log_update.emit("使用基于类的回调方式")
-                        
-                        # 创建一个自定义的回调类，通过闭包引用worker对象
-                        class CustomStopCallback(Callback):
-                            def __init__(self_callback, stop_event, worker):
-                                self_callback.stop_event = stop_event
-                                self_callback.worker = worker
-                            
-                            def on_train_start(self_callback, trainer):
-                                self_callback.worker._trainer_ref = trainer
-                                self_callback.worker.log_update.emit("训练开始，已捕获训练器引用")
-                                import threading
-                                self_callback.worker._process_ref = threading.current_thread()
-                                return True
-                            
-                            def on_train_batch_end(self_callback, trainer):
-                                return on_train_batch_end_fn(trainer)
-                            
-                            def on_train_epoch_end(self_callback, trainer):
-                                return on_train_epoch_end_fn(trainer)
-                        
-                        # 创建回调实例
-                        callback = CustomStopCallback(self._stop_event, self)
-                        train_args['callbacks'] = [callback]
-                        
-                        # 使用捕获器运行训练
-                        with stdout_capture:
-                            # 使用类回调进行训练
-                            self.log_update.emit("开始训练，第一个epoch可能较慢，因为需要进行初始化和缓存")
-                            results = model.train(**train_args)
-                    except Exception as e:
-                        self.log_update.emit(f"使用类回调失败: {str(e)}")
-                        # 类方法失败时，继续尝试函数方法
-                
-                # 如果基于类的回调失败或不可用，尝试函数回调
-                if results is None:
-                    # 方法2: 使用基于函数的回调方式
-                    try:
-                        self.log_update.emit("使用函数回调方式 (on_train_batch_end)")
-                        # 1. 挂载回调的标准方式（无需写复杂兼容逻辑）：
-                        model.add_callback("on_train_start", on_train_start_fn)
-                        model.add_callback("on_train_batch_end", on_train_batch_end_fn)
-                        model.add_callback("on_train_epoch_end", on_train_epoch_end_fn)
-                        # 使用捕获器运行训练 - 函数回调方式
-                        with stdout_capture:
-                            # 使用函数回调进行训练
-                            # train_args['callbacks'] = {
-                            #     'on_train_start': on_train_start_fn,
-                            #     'on_train_batch_end': on_train_batch_end_fn,
-                            #     'on_train_epoch_end': on_train_epoch_end_fn
-                            # }
-                            self.log_update.emit("开始训练，第一个epoch可能较慢，因为需要进行初始化和缓存")
-                            results = model.train(**train_args)
-                    except Exception as e:
-                        self.log_update.emit(f"函数回调方式1失败: {str(e)}")
-                        
-                        # 方法3: 使用另一种回调格式
-                        try:
-                            self.log_update.emit("使用函数回调方式 (on_fit_epoch_end)")
-                            train_args['callbacks'] = {
-                                'on_fit_start': lambda trainer: on_train_start_fn(trainer),
-                                'on_fit_epoch_end': lambda trainer: not self._stop_event.is_set(),
-                                'on_fit_batch_end': lambda trainer: not self._stop_event.is_set()
-                            }
-                            results = model.train(**train_args)
-                        except Exception as e:
-                            self.log_update.emit(f"函数回调方式2失败: {str(e)}")
-                            
-                            # 方法4: 无回调训练
-                            self.log_update.emit("尝试无回调训练")
-                            if 'callbacks' in train_args:
-                                del train_args['callbacks']
-                            results = model.train(**train_args)
-                
-                # 训练完成，停止监控线程
+                self.log_update.emit(
+                    f"加速选项: amp=True, rect=True | 早停已关闭 (patience=0)，将训练满 {self.epochs} 轮"
+                )
+                model.add_callback("on_train_start", on_train_start_fn)
+                model.add_callback("on_train_batch_end", on_train_batch_end_fn)
+                model.add_callback("on_train_epoch_end", on_train_epoch_end_fn)
+
+                with stdout_capture:
+                    self.log_update.emit("开始训练，第一个epoch可能较慢，因为需要进行初始化和缓存")
+                    results = model.train(**train_args)
+
                 stop_flag.set()
-                
-                # 检查结果并更新UI
+
                 if self._stop_event.is_set():
                     self.log_update.emit("训练被用户中止")
-                    self.training_complete.emit()
+                    self._finalize_after_stop(model, results)
+                    self.training_stopped.emit()
+                elif results is None:
+                    self.training_error.emit("训练未返回结果")
                 else:
-                    if results is not None and hasattr(results, 'metrics'):
-                        metrics = results.metrics
-                        self.log_update.emit(f"训练完成! 最终结果:")
-
-
-                        if hasattr(metrics, 'box_loss'):
-                            self.log_update.emit(f"box_loss: {metrics.box_loss:.4f}")
-                        if hasattr(metrics, 'cls_loss'):
-                            self.log_update.emit(f"cls_loss: {metrics.cls_loss:.4f}")
-                        if hasattr(metrics, 'map50'):
-                            self.log_update.emit(f"mAP50: {metrics.map50:.4f}")
-                    
                     self.log_update.emit("训练成功完成!")
-                    # 2. 训练完成后，自动将模型导出为 ONNX 格式
-                    self.log_update.emit("训练完成，正在导出为 ONNX 格式...")
+                    self.progress_update.emit(self.epochs)
+                    self._emit_final_metrics(results, model)
 
-                    # 导出 best.pt 为 ONNX
-                    onnx_path = model.export(
-                        format="onnx",
-                        imgsz=self.img_size,
-                        dynamic=False,  # 如果需要固定输入尺寸填 False；需要动态输入尺寸填 True
-                        simplify=True  # 自动优化 ONNX 结构
-                    )
+                    best_path = self._locate_best_weights(model, results)
+                    if best_path:
+                        self.log_update.emit(f"最佳权重: {best_path}")
+                        published = self._publish_models_to_project(best_path)
+                        if published.get('best_pt'):
+                            best_path = published['best_pt']
+                            self.log_update.emit(f"已保存到项目: {best_path}")
+                        if published.get('best_onnx'):
+                            self.log_update.emit(f"ONNX 模型: {published['best_onnx']}")
+                        self.best_weights_ready.emit(best_path)
+                    else:
+                        self.log_update.emit("警告: 未找到 best.pt")
 
-                    self.log_update.emit(f"ONNX 模型导出成功！路径为: {onnx_path}")
-                    self.progress_update.emit(100)
                     self.training_complete.emit()
                 
             except Exception as e:
+                stop_flag.set()
                 if self._stop_event.is_set():
                     self.log_update.emit("训练已被用户中止")
-                    self.training_complete.emit()
+                    try:
+                        self._finalize_after_stop(model if 'model' in locals() else None,
+                                                  results if 'results' in locals() else None)
+                    except Exception as finalize_err:
+                        self.log_update.emit(f"中止后整理模型失败: {finalize_err}")
+                    self.training_stopped.emit()
                 else:
                     self.training_error.emit(f"训练错误: {str(e)}")
         
@@ -770,23 +711,450 @@ class TrainingWorker(QObject):
                     self.log_update.emit("已尝试强制终止训练线程")
             except Exception as e:
                 self.log_update.emit(f"尝试强制终止训练时出错: {str(e)}")
-        
-        # Signal that training was stopped by user
-        threading.Thread(target=self._emit_training_complete, daemon=True).start()
-    
-    def _emit_training_complete(self):
-        """Emit training complete signal after a short delay to allow cleanup"""
-        time.sleep(0.5)  # Short delay to allow other operations to complete
-        self.training_complete.emit()
-    
+
+    def _finalize_after_stop(self, model, results) -> None:
+        """用户停止训练时：若已有 best/last 权重，仍复制到项目并导出 ONNX。"""
+        best_path = self._locate_best_weights(model, results)
+        if not best_path:
+            # 再找 last.pt 作为兜底
+            run_name = getattr(self, 'effective_run_name', None) or self.project_name or ''
+            candidates = []
+            if run_name:
+                candidates.append(os.path.join(self.output_dir, run_name, 'weights', 'last.pt'))
+                candidates.append(os.path.join(self.output_dir, run_name, 'weights', 'best.pt'))
+            candidates.append(os.path.join(self.output_dir, 'weights', 'last.pt'))
+            for path in candidates:
+                if path and os.path.isfile(path):
+                    best_path = os.path.abspath(path)
+                    break
+        if not best_path:
+            self.log_update.emit("中止时尚未生成可用权重，跳过 ONNX 导出")
+            return
+
+        self.log_update.emit(f"中止前已有权重，正在整理到项目并导出 ONNX: {best_path}")
+        try:
+            published = self._publish_models_to_project(best_path)
+            if published.get('best_pt'):
+                self.log_update.emit(f"已保存到项目: {published['best_pt']}")
+                self.best_weights_ready.emit(published['best_pt'])
+            if published.get('best_onnx'):
+                self.log_update.emit(f"ONNX 模型: {published['best_onnx']}")
+            elif self.export_onnx:
+                self.log_update.emit("未能生成 ONNX（请检查导出依赖或日志）")
+        except Exception as e:
+            self.log_update.emit(f"中止后导出模型失败: {e}")
+
+    def _make_run_name(self, stamp: str) -> str:
+        """生成带时间戳的唯一 run 名称，避免覆盖旧模型。"""
+        import re
+        base = (self.project_name or '').strip()
+        if not base:
+            return stamp
+        # 调用方已传入纯时间戳时不再二次追加
+        if re.fullmatch(r'\d{8}-\d{6}', base):
+            return base
+        if base.endswith('_' + stamp) or base.endswith(stamp):
+            return base
+        return f"{base}_{stamp}"
+
     def _check_gpu(self):
         """Check if CUDA is available and return appropriate device."""
-        if torch.cuda.is_available():
-            return 0  # Use first GPU
+        if self.use_gpu and torch.cuda.is_available():
+            device_id = max(0, min(int(self.gpu_device), torch.cuda.device_count() - 1))
+            return device_id
+        if not self.use_gpu:
+            self.log_update.emit("设置中已禁用 GPU，使用 CPU 训练")
         else:
-            self.log_update.emit("CUDA not available, using CPU")
-            return 'cpu'
-    
+            self.log_update.emit("未检测到 CUDA，使用 CPU 训练")
+        return 'cpu'
+
+    def _locate_best_weights(self, model, results) -> str:
+        """定位训练产出的 best.pt。"""
+        candidates = []
+        try:
+            if results is not None and hasattr(results, 'save_dir') and results.save_dir:
+                candidates.append(os.path.join(str(results.save_dir), 'weights', 'best.pt'))
+        except Exception:
+            pass
+        try:
+            trainer = getattr(model, 'trainer', None)
+            if trainer is not None and getattr(trainer, 'best', None):
+                candidates.append(str(trainer.best))
+            if trainer is not None and getattr(trainer, 'save_dir', None):
+                candidates.append(os.path.join(str(trainer.save_dir), 'weights', 'best.pt'))
+        except Exception:
+            pass
+
+        run_name = getattr(self, 'effective_run_name', None) or self.project_name or ''
+        if run_name:
+            candidates.append(os.path.join(self.output_dir, run_name, 'weights', 'best.pt'))
+            candidates.append(os.path.join(self.output_dir, run_name, 'weights', 'last.pt'))
+        candidates.append(os.path.join(self.output_dir, 'weights', 'best.pt'))
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return os.path.abspath(path)
+
+        # 兜底：在输出目录下找最新 best.pt
+        newest = None
+        newest_mtime = -1
+        for root, _, files in os.walk(self.output_dir):
+            if 'best.pt' in files:
+                path = os.path.join(root, 'best.pt')
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest = path
+        return os.path.abspath(newest) if newest else ''
+
+    def _emit_final_metrics(self, results, model) -> None:
+        """训练结束时打印最终 metric。"""
+        self.log_update.emit("=" * 50)
+        self.log_update.emit("最终 Metrics:")
+        printed = False
+
+        # 1) results_dict（ultralytics 常见）
+        results_dict = None
+        for obj in (results, getattr(results, 'metrics', None), getattr(model, 'metrics', None)):
+            if obj is None:
+                continue
+            if hasattr(obj, 'results_dict') and obj.results_dict:
+                results_dict = dict(obj.results_dict)
+                break
+            if isinstance(obj, dict):
+                results_dict = dict(obj)
+                break
+
+        if results_dict:
+            key_map = [
+                ('metrics/precision(B)', 'precision'),
+                ('metrics/recall(B)', 'recall'),
+                ('metrics/mAP50(B)', 'mAP50'),
+                ('metrics/mAP50-95(B)', 'mAP50-95'),
+                ('metrics/precision', 'precision'),
+                ('metrics/recall', 'recall'),
+                ('metrics/mAP50', 'mAP50'),
+                ('metrics/mAP50-95', 'mAP50-95'),
+            ]
+            seen = set()
+            for key, label in key_map:
+                if key in results_dict and label not in seen:
+                    try:
+                        self.log_update.emit(f"  {label}: {float(results_dict[key]):.4f}")
+                        seen.add(label)
+                        printed = True
+                    except (TypeError, ValueError):
+                        pass
+            # 补充打印其余 numeric metrics
+            for key, val in results_dict.items():
+                if not str(key).startswith('metrics/'):
+                    continue
+                short = str(key).split('/', 1)[-1]
+                if short.rstrip('(B)') in seen or short in seen:
+                    continue
+                try:
+                    self.log_update.emit(f"  {key}: {float(val):.4f}")
+                    printed = True
+                except (TypeError, ValueError):
+                    pass
+
+        # 2) box 属性兜底
+        if not printed:
+            box = None
+            for obj in (results, getattr(results, 'metrics', None), getattr(model, 'metrics', None)):
+                if obj is not None and hasattr(obj, 'box'):
+                    box = obj.box
+                    break
+            if box is not None:
+                for attr, label in (
+                    ('mp', 'precision'),
+                    ('mr', 'recall'),
+                    ('map50', 'mAP50'),
+                    ('map', 'mAP50-95'),
+                ):
+                    if hasattr(box, attr):
+                        try:
+                            self.log_update.emit(f"  {label}: {float(getattr(box, attr)):.4f}")
+                            printed = True
+                        except (TypeError, ValueError):
+                            pass
+
+        # 3) results.csv 最后一行
+        if not printed:
+            csv_path = None
+            save_dir = getattr(results, 'save_dir', None) if results is not None else None
+            search_roots = []
+            if save_dir:
+                search_roots.append(str(save_dir))
+            run_name = self.project_name or ''
+            if run_name:
+                search_roots.append(os.path.join(self.output_dir, run_name))
+            search_roots.append(self.output_dir)
+            for root in search_roots:
+                candidate = os.path.join(root, 'results.csv')
+                if os.path.isfile(candidate):
+                    csv_path = candidate
+                    break
+                if os.path.isdir(root):
+                    for dirpath, _, filenames in os.walk(root):
+                        if 'results.csv' in filenames:
+                            csv_path = os.path.join(dirpath, 'results.csv')
+                            break
+                if csv_path:
+                    break
+            if csv_path:
+                try:
+                    with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = [ln.strip() for ln in f if ln.strip()]
+                    if len(lines) >= 2:
+                        headers = [h.strip() for h in lines[0].split(',')]
+                        values = [v.strip() for v in lines[-1].split(',')]
+                        interesting = (
+                            'metrics/precision(B)', 'metrics/recall(B)',
+                            'metrics/mAP50(B)', 'metrics/mAP50-95(B)',
+                            'metrics/precision', 'metrics/recall',
+                            'metrics/mAP50', 'metrics/mAP50-95',
+                            'precision', 'recall', 'mAP50', 'mAP50-95',
+                        )
+                        for key in interesting:
+                            if key in headers:
+                                idx = headers.index(key)
+                                if idx < len(values):
+                                    try:
+                                        self.log_update.emit(f"  {key}: {float(values[idx]):.4f}")
+                                        printed = True
+                                    except ValueError:
+                                        pass
+                        self.log_update.emit(f"  (来源: {csv_path})")
+                except Exception as e:
+                    self.log_update.emit(f"  读取 results.csv 失败: {e}")
+
+        if not printed:
+            self.log_update.emit("  (未能解析到 metric，请查看 results.csv)")
+        self.log_update.emit("=" * 50)
+
+    def _publish_models_to_project(self, best_path: str) -> dict:
+        """将 best.pt / ONNX 整理到带时间戳的项目输出目录，避免覆盖旧模型。"""
+        import shutil
+        from ultralytics import YOLO
+
+        published = {'best_pt': '', 'best_onnx': '', 'last_pt': '', 'run_dir': ''}
+        if not best_path or not os.path.isfile(best_path):
+            return published
+
+        stamp = getattr(self, 'run_stamp', None) or time.strftime("%Y%m%d-%H%M%S")
+        run_name = getattr(self, 'effective_run_name', None) or self._make_run_name(stamp)
+        run_root = os.path.join(self.output_dir, run_name)
+        os.makedirs(run_root, exist_ok=True)
+        weights_dir = os.path.join(run_root, 'weights')
+        os.makedirs(weights_dir, exist_ok=True)
+        published['run_dir'] = os.path.abspath(run_root)
+
+        # 时间戳文件名，同时保留 best.pt 便于兼容
+        stamped_pt_name = f'best_{stamp}.pt'
+        stamped_onnx_name = f'best_{stamp}.onnx'
+        stamped_last_name = f'last_{stamp}.pt'
+
+        dest_best = os.path.join(weights_dir, 'best.pt')
+        dest_best_flat = os.path.join(run_root, 'best.pt')
+        dest_best_stamped = os.path.join(run_root, stamped_pt_name)
+        try:
+            if os.path.abspath(best_path) != os.path.abspath(dest_best):
+                shutil.copy2(best_path, dest_best)
+            src_for_flat = dest_best if os.path.isfile(dest_best) else best_path
+            shutil.copy2(src_for_flat, dest_best_flat)
+            shutil.copy2(src_for_flat, dest_best_stamped)
+            published['best_pt'] = os.path.abspath(dest_best_stamped)
+        except Exception as e:
+            self.log_update.emit(f"复制 best.pt 失败: {e}")
+            published['best_pt'] = os.path.abspath(best_path)
+
+        # last.pt（若存在）一并放入项目
+        src_last = os.path.join(os.path.dirname(best_path), 'last.pt')
+        if os.path.isfile(src_last):
+            try:
+                dest_last = os.path.join(weights_dir, 'last.pt')
+                if os.path.abspath(src_last) != os.path.abspath(dest_last):
+                    shutil.copy2(src_last, dest_last)
+                last_src = dest_last if os.path.isfile(dest_last) else src_last
+                shutil.copy2(last_src, os.path.join(run_root, 'last.pt'))
+                shutil.copy2(last_src, os.path.join(run_root, stamped_last_name))
+                published['last_pt'] = os.path.abspath(os.path.join(run_root, stamped_last_name))
+            except Exception as e:
+                self.log_update.emit(f"复制 last.pt 失败: {e}")
+
+        if not self.export_onnx:
+            return published
+
+        try:
+            self.log_update.emit(f"正在导出 ONNX 格式到: {run_root}")
+            export_model = YOLO(published['best_pt'] or best_path)
+            onnx_path = export_model.export(
+                format="onnx",
+                imgsz=self.img_size,
+                dynamic=False,
+                simplify=True,
+            )
+            if not onnx_path:
+                guess = os.path.splitext(published['best_pt'] or best_path)[0] + '.onnx'
+                onnx_path = guess if os.path.isfile(guess) else ''
+
+            if onnx_path and os.path.isfile(str(onnx_path)):
+                onnx_path = os.path.abspath(str(onnx_path))
+                dest_onnx = os.path.join(run_root, 'best.onnx')
+                dest_onnx_stamped = os.path.join(run_root, stamped_onnx_name)
+                dest_onnx_weights = os.path.join(weights_dir, 'best.onnx')
+                if os.path.abspath(onnx_path) != os.path.abspath(dest_onnx):
+                    shutil.copy2(onnx_path, dest_onnx)
+                onnx_src = dest_onnx if os.path.isfile(dest_onnx) else onnx_path
+                shutil.copy2(onnx_src, dest_onnx_stamped)
+                shutil.copy2(onnx_src, dest_onnx_weights)
+                published['best_onnx'] = os.path.abspath(dest_onnx_stamped)
+            else:
+                self.log_update.emit("ONNX 导出完成但未找到输出文件")
+        except Exception as export_err:
+            self.log_update.emit(f"ONNX 导出跳过: {export_err}")
+
+        return published
+
+    def _has_images(self, directory: str) -> bool:
+        if not directory or not os.path.isdir(directory):
+            return False
+        try:
+            for name in os.listdir(directory):
+                if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _swap_labels_to_images(self, path: str) -> str:
+        """将 labels 目录路径替换为对应的 images 目录路径。"""
+        if not path:
+            return path
+        normalized = path.replace('\\', '/')
+        if '/labels/' not in normalized and not normalized.endswith('/labels'):
+            return path
+        candidate = normalized.replace('/labels/', '/images/')
+        if candidate.endswith('/labels'):
+            candidate = candidate[:-len('/labels')] + '/images'
+        candidate = candidate.replace('/', os.sep)
+        return os.path.normpath(candidate)
+
+    def _resolve_image_dir(self, directory: str, split_name: str) -> str:
+        """解析并修正单个 train/val 图像目录。"""
+        directory = os.path.abspath(self._normalize_path(directory))
+        if not os.path.isdir(directory):
+            return directory
+
+        if self._has_images(directory):
+            return directory
+
+        alt = self._swap_labels_to_images(directory)
+        if alt != directory and os.path.isdir(alt) and self._has_images(alt):
+            self.log_update.emit(
+                f"自动修正{split_name}路径: 标签目录 -> 图像目录\n  {directory}\n  -> {alt}"
+            )
+            return alt
+
+        parent = os.path.dirname(directory)
+        grand = os.path.dirname(parent)
+        split = os.path.basename(directory)
+        if os.path.basename(parent) == 'labels' and split in ('train', 'val', 'test'):
+            candidate = os.path.join(grand, 'images', split)
+            if os.path.isdir(candidate) and self._has_images(candidate):
+                self.log_update.emit(
+                    f"自动修正{split_name}路径:\n  {directory}\n  -> {candidate}"
+                )
+                return candidate
+
+        return directory
+
+    def _resolve_yolo_dataset_config(self) -> dict:
+        """根据 UI 填写的目录生成正确的 YOLO data.yaml 配置。"""
+        train_dir = self._resolve_image_dir(self.train_dir, '训练集')
+        val_dir = self._resolve_image_dir(self.val_dir, '验证集')
+
+        if not os.path.isdir(train_dir):
+            raise FileNotFoundError(f"训练图像目录不存在: {train_dir}")
+        if not self._has_images(train_dir):
+            raise FileNotFoundError(
+                f"训练目录中没有图像文件: {train_dir}\n"
+                "请确认「训练图像目录」指向 images/train，而不是 labels/train。"
+            )
+
+        if not os.path.isdir(val_dir) or not self._has_images(val_dir):
+            self.log_update.emit(f"验证图像目录不可用，将使用训练集作为验证集: {train_dir}")
+            val_dir = train_dir
+
+        dataset_root = self._find_common_parent(train_dir, val_dir)
+        train_rel = os.path.relpath(train_dir, dataset_root).replace('\\', '/')
+        val_rel = os.path.relpath(val_dir, dataset_root).replace('\\', '/')
+
+        config = {
+            'path': dataset_root.replace('\\', '/'),
+            'train': train_rel,
+            'val': val_rel,
+        }
+        self.log_update.emit(
+            f"数据集配置:\n  path: {config['path']}\n  train: {config['train']}\n  val: {config['val']}"
+        )
+        return config
+
+    def _write_yolo_yaml(self, yaml_path: str, config: dict, class_names: list) -> None:
+        import yaml
+        data = {
+            'path': config['path'],
+            'train': config['train'],
+            'val': config['val'],
+            'nc': len(class_names),
+            'names': class_names,
+        }
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    def _yaml_split_path(self, data: dict, key: str) -> str:
+        base = data.get('path', '')
+        rel = data.get(key, '')
+        if not rel:
+            return ''
+        if os.path.isabs(rel):
+            return self._normalize_path(rel)
+        return self._normalize_path(os.path.join(base, rel))
+
+    def _yaml_paths_valid(self, yaml_path: str) -> bool:
+        import yaml
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            train_path = self._yaml_split_path(data, 'train')
+            return bool(train_path and os.path.isdir(train_path) and self._has_images(train_path))
+        except Exception:
+            return False
+
+    def _ensure_dataset_ready(self, yaml_path: str) -> None:
+        import yaml
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+
+        train_path = self._yaml_split_path(data, 'train')
+        val_path = self._yaml_split_path(data, 'val')
+
+        if not train_path or not os.path.isdir(train_path) or not self._has_images(train_path):
+            raise FileNotFoundError(
+                f"训练图像路径无效: {train_path or '(空)'}\n"
+                "请检查训练 Tab 中的「训练图像目录」是否指向 images/train。"
+            )
+
+        if not val_path or not os.path.isdir(val_path) or not self._has_images(val_path):
+            self.log_update.emit(f"验证图像路径无效，将改用训练集: {train_path}")
+            data['val'] = data.get('train')
+            with open(yaml_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
     def _create_dataset_yaml(self):
         """
         Create the dataset YAML file based on the selected format.
@@ -803,314 +1171,305 @@ class TrainingWorker(QObject):
         cache_info_path = os.path.join(self.output_dir, "datasets", "cache_info.txt")
         if os.path.exists(yaml_path) and os.path.exists(cache_info_path):
             try:
-                with open(cache_info_path, 'r') as f:
-                    cached_paths = f.read().strip().split('\n')
-                
-                if len(cached_paths) >= 2 and cached_paths[0] == self.train_dir and cached_paths[1] == self.val_dir:
-                    self.log_update.emit("使用缓存的数据集配置...")
-                    return yaml_path
-            except:
+                with open(cache_info_path, 'r', encoding='utf-8') as f:
+                    cached = f.read().strip()
+                if cached == self._cache_fingerprint().strip():
+                    if self._yaml_paths_valid(yaml_path):
+                        self.log_update.emit("使用缓存的数据集配置...")
+                        return yaml_path
+                    self.log_update.emit("缓存的数据集配置无效，重新生成...")
+            except Exception:
                 pass
-        
-        # 预处理和验证路径
-        train_dir = self._normalize_path(self.train_dir)
-        val_dir = self._normalize_path(self.val_dir)
-        
-        # 检查训练和验证目录是否存在
-        train_exists = os.path.exists(train_dir)
-        val_exists = os.path.exists(val_dir)
-        
-        if not train_exists:
-            self.log_update.emit(f"警告: 训练目录不存在: {train_dir}")
-        
-        if not val_exists:
-            self.log_update.emit(f"警告: 验证目录不存在: {val_dir}")
-            # 如果验证目录不存在，使用训练目录替代
-            self.log_update.emit("将使用训练目录作为验证数据")
-            val_dir = train_dir
-            
-        # Handle different dataset formats
+
         if self.dataset_format == "YOLO":
-            # For YOLO format, we look for data.yaml in the dataset directory
-            possible_yaml_paths = [
-                os.path.join(self.train_dir, "data.yaml"),
-                os.path.join(os.path.dirname(self.train_dir), "data.yaml"),
-                os.path.join(os.path.dirname(os.path.dirname(self.train_dir)), "data.yaml")
-            ]
-            
-            for path in possible_yaml_paths:
-                if os.path.exists(path):
-                    self.log_update.emit(f"找到YOLO格式数据集配置文件: {path}")
-                    # 复制原始YAML到我们的输出目录
-                    import shutil
-                    shutil.copy(path, yaml_path)
-                    
-                    # 读取并修改路径（如果需要）
-                    self._update_paths_in_yaml(path, yaml_path)
-                    
-                    # 保存缓存信息
-                    try:
-                        with open(cache_info_path, 'w') as f:
-                            f.write(f"{self.train_dir}\n{self.val_dir}")
-                        self.log_update.emit("已缓存数据集信息，下次训练将加速初始化")
-                    except Exception as e:
-                        self.log_update.emit(f"保存缓存信息失败: {str(e)}")
-                    
-                    return yaml_path
-            
-            # 如果没有找到现有的yaml，创建一个
-            self.log_update.emit("未找到YOLO格式数据集配置文件，将创建新文件")
-            
-            # 检查目录结构是否标准YOLO结构
-            train_images_dir = train_dir
-            train_labels_dir = None
-            val_images_dir = val_dir
-            val_labels_dir = None
-            
-            # 检查是否是标准的YOLO目录结构 (根目录/images/train, 根目录/labels/train)
-            if os.path.basename(train_dir) == 'train' and os.path.basename(os.path.dirname(train_dir)) == 'images':
-                base_dir = os.path.dirname(os.path.dirname(train_dir))
-                possible_labels_dir = os.path.join(base_dir, 'labels', 'train')
-                if os.path.exists(possible_labels_dir):
-                    train_labels_dir = possible_labels_dir
-                    self.log_update.emit(f"找到匹配的训练标签目录: {train_labels_dir}")
-            
-            if os.path.basename(val_dir) == 'val' and os.path.basename(os.path.dirname(val_dir)) == 'images':
-                base_dir = os.path.dirname(os.path.dirname(val_dir))
-                possible_labels_dir = os.path.join(base_dir, 'labels', 'val')
-                if os.path.exists(possible_labels_dir):
-                    val_labels_dir = possible_labels_dir
-                    self.log_update.emit(f"找到匹配的验证标签目录: {val_labels_dir}")
-            
-            # 如果没有找到标准结构，尝试搜索标签文件
-            if not train_labels_dir:
-                self.log_update.emit("尝试查找训练标签目录...")
-                # 检查常见的可能标签目录
-                possible_label_dirs = [
-                    os.path.join(os.path.dirname(train_dir), 'labels'),
-                    os.path.join(os.path.dirname(train_dir), 'labels', 'train'),
-                    os.path.join(train_dir, '..', 'labels'),
-                    os.path.join(train_dir, '..', 'labels', 'train'),
-                    os.path.join(os.path.dirname(os.path.dirname(train_dir)), 'labels', 'train')
-                ]
-                
-                for label_dir in possible_label_dirs:
-                    if os.path.exists(label_dir) and os.listdir(label_dir):
-                        train_labels_dir = label_dir
-                        self.log_update.emit(f"找到可能的训练标签目录: {train_labels_dir}")
-                        break
-            
-            if not val_labels_dir:
-                self.log_update.emit("尝试查找验证标签目录...")
-                # 检查常见的可能标签目录
-                possible_label_dirs = [
-                    os.path.join(os.path.dirname(val_dir), 'labels'),
-                    os.path.join(os.path.dirname(val_dir), 'labels', 'val'),
-                    os.path.join(val_dir, '..', 'labels'),
-                    os.path.join(val_dir, '..', 'labels', 'val'),
-                    os.path.join(os.path.dirname(os.path.dirname(val_dir)), 'labels', 'val')
-                ]
-                
-                for label_dir in possible_label_dirs:
-                    if os.path.exists(label_dir) and os.listdir(label_dir):
-                        val_labels_dir = label_dir
-                        self.log_update.emit(f"找到可能的验证标签目录: {val_labels_dir}")
-                        break
-            
-            # 验证找到的标签目录是否包含与图片匹配的标签
-            if train_labels_dir and os.path.exists(train_images_dir):
-                # 在训练图像目录中找到图片
-                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
-                train_images = []
-                
-                for root, _, files in os.walk(train_images_dir):
-                    for file in files:
-                        if any(file.lower().endswith(ext) for ext in image_extensions):
-                            train_images.append(os.path.join(root, file))
-                
-                if train_images:
-                    # 检查是否有匹配的标签文件
-                    matching_labels = 0
-                    for img_file in train_images[:10]:  # 只检查前10个样本
-                        img_basename = os.path.splitext(os.path.basename(img_file))[0]
-                        label_file = os.path.join(train_labels_dir, f"{img_basename}.txt")
-                        if os.path.exists(label_file):
-                            matching_labels += 1
-                    
-                    if matching_labels > 0:
-                        self.log_update.emit(f"验证训练标签: 找到 {matching_labels}/10 个匹配的标签文件")
-                    else:
-                        self.log_update.emit("警告: 训练标签目录中没有找到与图片匹配的标签文件")
-                        train_labels_dir = None
-            
-            # 验证验证集标签目录
-            if val_labels_dir and os.path.exists(val_images_dir):
-                # 在验证图像目录中找到图片
-                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
-                val_images = []
-                
-                for root, _, files in os.walk(val_images_dir):
-                    for file in files:
-                        if any(file.lower().endswith(ext) for ext in image_extensions):
-                            val_images.append(os.path.join(root, file))
-                
-                if val_images:
-                    # 检查是否有匹配的标签文件
-                    matching_labels = 0
-                    for img_file in val_images[:10]:  # 只检查前10个样本
-                        img_basename = os.path.splitext(os.path.basename(img_file))[0]
-                        label_file = os.path.join(val_labels_dir, f"{img_basename}.txt")
-                        if os.path.exists(label_file):
-                            matching_labels += 1
-                    
-                    if matching_labels > 0:
-                        self.log_update.emit(f"验证验证集标签: 找到 {matching_labels}/10 个匹配的标签文件")
-                    else:
-                        self.log_update.emit("警告: 验证集标签目录中没有找到与图片匹配的标签文件")
-                        val_labels_dir = None
-            
-            # 如果我们需要创建一个新的数据集结构
-            if train_labels_dir is None or val_labels_dir is None:
-                self.log_update.emit("未找到完整的标签结构，将尝试建立新的YOLO格式数据集")
-                
-                # 创建YOLO格式的目录结构
-                yolo_dataset_dir = os.path.join(self.output_dir, "yolo_dataset")
-                os.makedirs(os.path.join(yolo_dataset_dir, "images", "train"), exist_ok=True)
-                os.makedirs(os.path.join(yolo_dataset_dir, "images", "val"), exist_ok=True)
-                os.makedirs(os.path.join(yolo_dataset_dir, "labels", "train"), exist_ok=True)
-                os.makedirs(os.path.join(yolo_dataset_dir, "labels", "val"), exist_ok=True)
-                
-                # 后续可以添加代码来复制和准备数据到这个结构
-                self.log_update.emit(f"创建了标准YOLO目录结构: {yolo_dataset_dir}")
-                
-                # 但目前我们暂时使用原始目录
-                train_path = os.path.dirname(train_dir)
-                train_rel = os.path.basename(train_dir)
-                val_path = os.path.dirname(val_dir)
-                val_rel = os.path.basename(val_dir)
-            else:
-                # 使用找到的目录结构
-                # 找出训练目录和标签目录的共同父目录
-                train_path = self._find_common_parent(train_images_dir, train_labels_dir)
-                # 获取相对路径
-                train_rel = os.path.relpath(train_images_dir, train_path)
-                val_path = self._find_common_parent(val_images_dir, val_labels_dir)
-                val_rel = os.path.relpath(val_images_dir, val_path)
-                
-                self.log_update.emit(f"使用现有的目录结构，基础路径: {train_path}")
-                self.log_update.emit(f"训练图像相对路径: {train_rel}")
-                self.log_update.emit(f"验证图像相对路径: {val_rel}")
-            
-            # 获取类名
+            config = self._resolve_yolo_dataset_config()
             class_names = self._get_class_names()
-            
-            # 创建配置文件
-            with open(yaml_path, 'w') as f:
-                f.write(f"# Dataset configuration for YOLO format\n")
-                f.write(f"path: {train_path}\n")
-                f.write(f"train: {train_rel}\n")
-                f.write(f"val: {val_rel}\n")
-                f.write(f"nc: {len(class_names)}\n")
-                f.write(f"names: {class_names}\n")
-            
-            # 验证生成的YAML是否有效
+            self._write_yolo_yaml(yaml_path, config, class_names)
             self._validate_yaml(yaml_path)
-            
             self.log_update.emit(f"已创建YOLO格式数据集配置文件: {yaml_path}")
-            
-            # 保存缓存信息
             try:
-                with open(cache_info_path, 'w') as f:
-                    f.write(f"{self.train_dir}\n{self.val_dir}")
-                self.log_update.emit("已缓存数据集信息，下次训练将加速初始化")
+                with open(cache_info_path, 'w', encoding='utf-8') as f:
+                    f.write(self._cache_fingerprint())
             except Exception as e:
                 self.log_update.emit(f"保存缓存信息失败: {str(e)}")
-            
             return yaml_path
-            
-        else:
-            # 处理COCO和VOC格式
-            # Get class names based on the dataset format
-            class_names = self._get_class_names()
-            
-            with open(yaml_path, 'w') as f:
-                f.write(f"# Dataset configuration\n")
-                f.write(f"path: {os.path.dirname(self.train_dir)}\n")
-                f.write(f"train: {os.path.basename(self.train_dir)}\n")
-                f.write(f"val: {os.path.basename(self.val_dir)}\n")
-                
-                # Write class names
-                f.write(f"nc: {len(class_names)}\n")
-                f.write(f"names: {class_names}\n")
-            
-            self.log_update.emit(f"Created dataset configuration at {yaml_path}")
-            
-            # 保存缓存信息
-            try:
-                with open(cache_info_path, 'w') as f:
-                    f.write(f"{self.train_dir}\n{self.val_dir}")
-                self.log_update.emit("已缓存数据集信息，下次训练将加速初始化")
-            except Exception as e:
-                self.log_update.emit(f"保存缓存信息失败: {str(e)}")
-            
-            return yaml_path
-    
-    def _update_paths_in_yaml(self, src_yaml, dst_yaml):
-        """更新YAML文件中的路径以适应当前环境"""
-        import yaml
-        
+
+        # COCO / VOC：同样按图像目录解析相对路径，避免 path/train 写错
         try:
-            # 读取原始YAML
-            with open(src_yaml, 'r') as f:
-                data = yaml.safe_load(f)
-            
-            # 规范化训练和验证目录
+            config = self._resolve_yolo_dataset_config()
+        except Exception as e:
+            self.log_update.emit(f"解析数据集路径失败，回退到简单路径: {e}")
             train_dir = self._normalize_path(self.train_dir)
             val_dir = self._normalize_path(self.val_dir)
-            
-            # 检查验证目录是否存在
             if not os.path.exists(val_dir):
-                self.log_update.emit(f"警告: 验证目录不存在: {val_dir}")
-                self.log_update.emit("将使用训练目录作为验证数据")
                 val_dir = train_dir
-            
-            # 检查并更新路径
-            if 'path' in data:
-                # 如果原始路径不存在，改为使用当前路径
-                original_path = data['path']
-                if not os.path.exists(original_path):
-                    data['path'] = os.path.dirname(train_dir)
-                    self.log_update.emit(f"更新数据集路径: {original_path} -> {data['path']}")
-            else:
-                data['path'] = os.path.dirname(train_dir)
-            
-            # 确保train和val字段存在和正确
-            data['train'] = os.path.basename(train_dir)
-            data['val'] = os.path.basename(val_dir)
-            
-            # 确保路径格式正确(不要有多个连续的斜杠)
-            data['path'] = self._normalize_path(data['path'])
-            
-            # 写入更新后的YAML
-            with open(dst_yaml, 'w') as f:
-                yaml.dump(data, f, default_flow_style=False)
-            
-            # 验证生成的YAML文件
+            dataset_root = self._find_common_parent(train_dir, val_dir) or os.path.dirname(train_dir)
+            config = {
+                'path': dataset_root.replace('\\', '/'),
+                'train': os.path.relpath(train_dir, dataset_root).replace('\\', '/'),
+                'val': os.path.relpath(val_dir, dataset_root).replace('\\', '/'),
+            }
+
+        class_names = self._get_class_names()
+        self._write_yolo_yaml(yaml_path, config, class_names)
+        self._validate_yaml(yaml_path)
+        self.log_update.emit(f"已创建 {self.dataset_format} 数据集配置文件: {yaml_path}")
+
+        try:
+            with open(cache_info_path, 'w', encoding='utf-8') as f:
+                f.write(self._cache_fingerprint())
+            self.log_update.emit("已缓存数据集信息，下次训练将加速初始化")
+        except Exception as e:
+            self.log_update.emit(f"保存缓存信息失败: {str(e)}")
+
+        return yaml_path
+
+    def _cache_fingerprint(self) -> str:
+        """缓存指纹：包含图像/标签目录与 ROI，避免变更后误用旧 yaml。"""
+        roi = self.roi_norm if self.roi_enabled else (0.0, 0.0, 1.0, 1.0)
+        return '\n'.join([
+            self.train_dir or '',
+            self.val_dir or '',
+            self.train_labels_dir or '',
+            self.val_labels_dir or '',
+            self.dataset_format or '',
+            f'roi_enabled={int(bool(self.roi_enabled))}',
+            f'roi={roi[0]:.6f},{roi[1]:.6f},{roi[2]:.6f},{roi[3]:.6f}',
+        ])
+
+    def _roi_is_full_frame(self) -> bool:
+        x1, y1, x2, y2 = self.roi_norm
+        return (
+            abs(x1) < 1e-6 and abs(y1) < 1e-6
+            and abs(x2 - 1.0) < 1e-6 and abs(y2 - 1.0) < 1e-6
+        )
+
+    def _guess_labels_dir(self, images_dir: str, explicit_labels: str = '') -> str:
+        """根据图像目录推断对应 labels 目录。"""
+        if explicit_labels and os.path.isdir(explicit_labels):
+            return explicit_labels
+        images_dir = self._normalize_path(images_dir)
+        # .../images/train -> .../labels/train
+        parent = os.path.dirname(images_dir)
+        split = os.path.basename(images_dir)
+        if os.path.basename(parent) == 'images':
+            candidate = os.path.join(os.path.dirname(parent), 'labels', split)
+            if os.path.isdir(candidate):
+                return candidate
+        # 同级 labels
+        sibling = os.path.join(os.path.dirname(images_dir), 'labels')
+        if os.path.isdir(sibling):
+            return sibling
+        # 图像目录内直接放 txt
+        return images_dir
+
+    def _list_image_files(self, directory: str):
+        files = []
+        if not directory or not os.path.isdir(directory):
+            return files
+        for name in sorted(os.listdir(directory)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                files.append(os.path.join(directory, name))
+        return files
+
+    def _remap_yolo_label_line(self, line: str, img_w: int, img_h: int,
+                               rx1: int, ry1: int, rx2: int, ry2: int) -> str:
+        """将一行 YOLO 标签映射到 ROI 裁剪坐标系；无有效交集则返回空串。"""
+        parts = line.strip().split()
+        if len(parts) < 5:
+            return ''
+        crop_w = max(rx2 - rx1, 1)
+        crop_h = max(ry2 - ry1, 1)
+        try:
+            cls_id = int(float(parts[0]))
+        except ValueError:
+            return ''
+
+        # detect: class cx cy w h
+        if len(parts) == 5:
+            try:
+                cx, cy, bw, bh = map(float, parts[1:5])
+            except ValueError:
+                return ''
+            x1 = (cx - bw / 2) * img_w
+            y1 = (cy - bh / 2) * img_h
+            x2 = (cx + bw / 2) * img_w
+            y2 = (cy + bh / 2) * img_h
+            ix1 = max(x1, rx1)
+            iy1 = max(y1, ry1)
+            ix2 = min(x2, rx2)
+            iy2 = min(y2, ry2)
+            if ix2 - ix1 < 2 or iy2 - iy1 < 2:
+                return ''
+            ncx = ((ix1 + ix2) / 2 - rx1) / crop_w
+            ncy = ((iy1 + iy2) / 2 - ry1) / crop_h
+            nw = (ix2 - ix1) / crop_w
+            nh = (iy2 - iy1) / crop_h
+            ncx = min(max(ncx, 0.0), 1.0)
+            ncy = min(max(ncy, 0.0), 1.0)
+            nw = min(max(nw, 1e-6), 1.0)
+            nh = min(max(nh, 1e-6), 1.0)
+            return f'{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}'
+
+        # segment: class x1 y1 x2 y2 ...
+        if len(parts) >= 7 and (len(parts) - 1) % 2 == 0:
+            try:
+                coords = [float(v) for v in parts[1:]]
+            except ValueError:
+                return ''
+            pts = []
+            for i in range(0, len(coords), 2):
+                px = coords[i] * img_w
+                py = coords[i + 1] * img_h
+                # clamp 到 ROI
+                px = min(max(px, rx1), rx2)
+                py = min(max(py, ry1), ry2)
+                pts.append(((px - rx1) / crop_w, (py - ry1) / crop_h))
+            # 丢弃完全塌缩的多边形
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            if max(xs) - min(xs) < 1e-4 or max(ys) - min(ys) < 1e-4:
+                return ''
+            body = ' '.join(f'{x:.6f} {y:.6f}' for x, y in pts)
+            return f'{cls_id} {body}'
+
+        return ''
+
+    def _crop_split_with_roi(self, images_dir: str, labels_dir: str, out_images: str, out_labels: str,
+                             rx_n, ry_n, rw_n, rh_n) -> int:
+        """裁剪一个 split，返回成功写出的图像数。"""
+        import cv2
+
+        os.makedirs(out_images, exist_ok=True)
+        os.makedirs(out_labels, exist_ok=True)
+        count = 0
+        images = self._list_image_files(images_dir)
+        total = len(images)
+        for idx, img_path in enumerate(images):
+            if self._stop_event.is_set():
+                raise RuntimeError('训练已停止')
+            img = cv2.imread(img_path)
+            if img is None:
+                self.log_update.emit(f'跳过无法读取的图像: {img_path}')
+                continue
+            h, w = img.shape[:2]
+            rx1 = int(round(rx_n * w))
+            ry1 = int(round(ry_n * h))
+            rx2 = int(round((rx_n + rw_n) * w))
+            ry2 = int(round((ry_n + rh_n) * h))
+            rx1 = max(0, min(rx1, w - 1))
+            ry1 = max(0, min(ry1, h - 1))
+            rx2 = max(rx1 + 1, min(rx2, w))
+            ry2 = max(ry1 + 1, min(ry2, h))
+            cropped = img[ry1:ry2, rx1:rx2]
+            fname = os.path.basename(img_path)
+            stem = os.path.splitext(fname)[0]
+            out_img = os.path.join(out_images, fname)
+            if not cv2.imwrite(out_img, cropped):
+                # 部分扩展名写失败时回退 png
+                out_img = os.path.join(out_images, stem + '.png')
+                cv2.imwrite(out_img, cropped)
+
+            src_label = os.path.join(labels_dir, stem + '.txt')
+            out_label = os.path.join(out_labels, stem + '.txt')
+            lines_out = []
+            if os.path.isfile(src_label):
+                try:
+                    with open(src_label, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            mapped = self._remap_yolo_label_line(line, w, h, rx1, ry1, rx2, ry2)
+                            if mapped:
+                                lines_out.append(mapped)
+                except Exception as e:
+                    self.log_update.emit(f'读取标签失败 {src_label}: {e}')
+            with open(out_label, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines_out) + ('\n' if lines_out else ''))
+
+            count += 1
+            if total and (idx + 1) % max(1, total // 10) == 0:
+                self.log_update.emit(f'ROI 裁剪进度: {idx + 1}/{total}')
+        return count
+
+    def _apply_global_roi_if_needed(self):
+        """若启用全局 ROI，生成裁剪数据集并切换 train/val 目录。"""
+        if not self.roi_enabled or self._roi_is_full_frame():
+            if self.roi_enabled and self._roi_is_full_frame():
+                self.log_update.emit('ROI 为全图，跳过裁剪')
+            return
+
+        x1, y1, x2, y2 = self.roi_norm
+        x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+        y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+        if x2 - x1 < 0.01 or y2 - y1 < 0.01:
+            raise ValueError(f'ROI 过小，无法用于训练: ({x1}, {y1})-({x2}, {y2})')
+
+        self.roi_norm = (x1, y1, x2, y2)
+        rw, rh = x2 - x1, y2 - y1
+        self.log_update.emit(
+            f'启用全局 ROI 裁剪: ({x1:.4f}, {y1:.4f}) → ({x2:.4f}, {y2:.4f})'
+        )
+
+        train_img = self._resolve_image_dir(self.train_dir, '训练集')
+        val_img = self._resolve_image_dir(self.val_dir, '验证集')
+        if not os.path.isdir(val_img) or not self._has_images(val_img):
+            val_img = train_img
+
+        train_lbl = self._guess_labels_dir(train_img, self.train_labels_dir)
+        val_lbl = self._guess_labels_dir(val_img, self.val_labels_dir)
+
+        out_root = os.path.join(self.output_dir, 'datasets', 'roi_cropped')
+        # 清理旧裁剪结果，避免残留
+        import shutil
+        if os.path.isdir(out_root):
+            shutil.rmtree(out_root, ignore_errors=True)
+
+        train_out_img = os.path.join(out_root, 'images', 'train')
+        train_out_lbl = os.path.join(out_root, 'labels', 'train')
+        val_out_img = os.path.join(out_root, 'images', 'val')
+        val_out_lbl = os.path.join(out_root, 'labels', 'val')
+
+        n_train = self._crop_split_with_roi(
+            train_img, train_lbl, train_out_img, train_out_lbl, x1, y1, rw, rh
+        )
+        if n_train <= 0:
+            raise RuntimeError('ROI 裁剪后训练集为空，请检查图像目录与 ROI 设置')
+
+        same_val = os.path.normpath(val_img) == os.path.normpath(train_img)
+        if same_val:
+            n_val = n_train
+            val_out_img = train_out_img
+            val_out_lbl = train_out_lbl
+            self.log_update.emit('验证集与训练集相同，复用裁剪结果')
+        else:
+            n_val = self._crop_split_with_roi(
+                val_img, val_lbl, val_out_img, val_out_lbl, x1, y1, rw, rh
+            )
+            if n_val <= 0:
+                self.log_update.emit('ROI 裁剪后验证集为空，将使用训练集作为验证集')
+                val_out_img = train_out_img
+                val_out_lbl = train_out_lbl
+
+        self.train_dir = train_out_img
+        self.val_dir = val_out_img
+        self.train_labels_dir = train_out_lbl
+        self.val_labels_dir = val_out_lbl
+        self.log_update.emit(
+            f'ROI 裁剪完成: train={n_train} val={n_val if not same_val else n_train} → {out_root}'
+        )
+
+    def _update_paths_in_yaml(self, src_yaml, dst_yaml):
+        """更新YAML文件中的路径以适应当前环境"""
+        try:
+            config = self._resolve_yolo_dataset_config()
+            class_names = self._get_class_names()
+            self._write_yolo_yaml(dst_yaml, config, class_names)
             self._validate_yaml(dst_yaml)
-            
         except Exception as e:
             self.log_update.emit(f"更新YAML文件失败: {str(e)}，将创建新文件")
-            # 如果失败，创建新文件
+            config = self._resolve_yolo_dataset_config()
             class_names = self._get_class_names()
-            with open(dst_yaml, 'w') as f:
-                f.write(f"# Dataset configuration\n")
-                f.write(f"path: {os.path.dirname(train_dir)}\n")
-                f.write(f"train: {os.path.basename(train_dir)}\n")
-                f.write(f"val: {os.path.basename(val_dir)}\n")
-                f.write(f"nc: {len(class_names)}\n")
-                f.write(f"names: {class_names}\n")
-            
-            # 验证生成的YAML文件
+            self._write_yolo_yaml(dst_yaml, config, class_names)
             self._validate_yaml(dst_yaml)
     
     def _normalize_path(self, path):
@@ -1152,26 +1511,33 @@ class TrainingWorker(QObject):
                         with open(yaml_path, 'w') as f:
                             yaml.dump(data, f, default_flow_style=False)
             
-            # 检查训练和验证路径是否存在
             if 'path' in data and os.path.exists(data['path']):
                 if 'train' in data:
-                    train_path = os.path.join(data['path'], data['train'])
-                    if not os.path.exists(train_path):
-                        self.log_update.emit(f"警告: 训练路径不存在: {train_path}")
-                
+                    train_path = self._yaml_split_path(data, 'train')
+                    if not os.path.exists(train_path) or not self._has_images(train_path):
+                        self.log_update.emit(f"警告: 训练路径无效: {train_path}")
+                        alt = self._swap_labels_to_images(train_path)
+                        if alt != train_path and os.path.isdir(alt) and self._has_images(alt):
+                            dataset_root = self._find_common_parent(alt, alt)
+                            data['path'] = dataset_root.replace('\\', '/')
+                            data['train'] = os.path.relpath(alt, dataset_root).replace('\\', '/')
+                            self.log_update.emit(f"自动修复训练路径: {data['train']}")
+
                 if 'val' in data:
-                    val_path = os.path.join(data['path'], data['val'])
-                    if not os.path.exists(val_path):
-                        self.log_update.emit(f"警告: 验证路径不存在: {val_path}")
-                        
-                        # 如果验证路径不存在但训练路径存在，使用训练路径代替
-                        if 'train' in data and os.path.exists(os.path.join(data['path'], data['train'])):
+                    val_path = self._yaml_split_path(data, 'val')
+                    if not os.path.exists(val_path) or not self._has_images(val_path):
+                        self.log_update.emit(f"警告: 验证路径无效: {val_path}")
+                        alt = self._swap_labels_to_images(val_path)
+                        if alt != val_path and os.path.isdir(alt) and self._has_images(alt):
+                            dataset_root = data.get('path', self._find_common_parent(alt, alt))
+                            data['val'] = os.path.relpath(alt, dataset_root).replace('\\', '/')
+                            self.log_update.emit(f"自动修复验证路径: {data['val']}")
+                        elif 'train' in data:
                             data['val'] = data['train']
                             self.log_update.emit(f"自动设置验证集与训练集相同: {data['train']}")
-                            
-                            # 重新写入YAML
-                            with open(yaml_path, 'w') as f:
-                                yaml.dump(data, f, default_flow_style=False)
+
+                with open(yaml_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
         
         except Exception as e:
             self.log_update.emit(f"验证YAML文件失败: {str(e)}")
@@ -1221,87 +1587,101 @@ class TrainingWorker(QObject):
         
         return class_names
     
+    def _dataset_search_roots(self):
+        """返回用于查找 classes.txt / data.yaml 的目录列表。"""
+        roots = []
+        for path in (self.train_dir, self.val_dir, self.train_labels_dir, self.val_labels_dir):
+            if path and os.path.isdir(path):
+                roots.append(path)
+        train_dir = self._normalize_path(self.train_dir)
+        if os.path.basename(train_dir) in ('train', 'val') and os.path.basename(os.path.dirname(train_dir)) == 'images':
+            base = os.path.dirname(os.path.dirname(train_dir))
+            roots.extend([
+                base,
+                os.path.join(base, 'labels', os.path.basename(train_dir)),
+            ])
+        deduped = []
+        for root in roots:
+            norm = os.path.normpath(root)
+            if norm not in deduped:
+                deduped.append(norm)
+        return deduped
+
     def _get_yolo_class_names(self):
         """从YOLO格式数据集中提取类名"""
         class_names = []
-        
-        # 首先尝试从data.yaml文件中获取
-        possible_yaml_paths = [
-            os.path.join(self.train_dir, "data.yaml"),
-            os.path.join(os.path.dirname(self.train_dir), "data.yaml"),
-            os.path.join(os.path.dirname(os.path.dirname(self.train_dir)), "data.yaml")
-        ]
-        
-        for yaml_path in possible_yaml_paths:
+        search_roots = self._dataset_search_roots()
+
+        possible_yaml_paths = []
+        possible_class_files = []
+        for root in search_roots:
+            possible_yaml_paths.extend([
+                os.path.join(root, 'data.yaml'),
+                os.path.join(os.path.dirname(root), 'data.yaml'),
+                os.path.join(os.path.dirname(os.path.dirname(root)), 'data.yaml'),
+            ])
+            possible_class_files.extend([
+                os.path.join(root, 'classes.txt'),
+                os.path.join(os.path.dirname(root), 'classes.txt'),
+                os.path.join(os.path.dirname(os.path.dirname(root)), 'classes.txt'),
+            ])
+
+        for yaml_path in dict.fromkeys(possible_yaml_paths):
             if os.path.exists(yaml_path):
                 try:
                     import yaml
-                    with open(yaml_path, 'r') as f:
+                    with open(yaml_path, 'r', encoding='utf-8') as f:
                         data = yaml.safe_load(f)
-                    
-                    if 'names' in data:
+                    if data and 'names' in data:
+                        names = data['names']
+                        if isinstance(names, dict):
+                            names = [names[k] for k in sorted(names.keys(), key=lambda x: int(x) if str(x).isdigit() else x)]
                         self.log_update.emit(f"从YAML文件加载类名: {yaml_path}")
-                        return data['names']
+                        return list(names)
                 except Exception as e:
                     self.log_update.emit(f"从YAML读取类名失败: {str(e)}")
-        
-        # 然后尝试从classes.txt文件中获取
-        possible_class_files = [
-            os.path.join(self.train_dir, "classes.txt"),
-            os.path.join(os.path.dirname(self.train_dir), "classes.txt"),
-            os.path.join(os.path.dirname(os.path.dirname(self.train_dir)), "classes.txt")
-        ]
-        
-        for class_file in possible_class_files:
+
+        for class_file in dict.fromkeys(possible_class_files):
             if os.path.exists(class_file):
                 try:
-                    with open(class_file, 'r') as f:
-                        class_names = [line.strip() for line in f.readlines() if line.strip()]
-                    
+                    with open(class_file, 'r', encoding='utf-8') as f:
+                        class_names = [line.strip() for line in f if line.strip()]
                     if class_names:
                         self.log_update.emit(f"从classes.txt加载类名: {class_file}")
                         return class_names
                 except Exception as e:
                     self.log_update.emit(f"从classes.txt读取类名失败: {str(e)}")
-        
-        # 如果上述方法都失败，尝试从标签文件中推断
+
+        label_dirs = [p for p in (self.train_labels_dir, self.val_labels_dir) if p and os.path.isdir(p)]
+        if not label_dirs:
+            for root in search_roots:
+                if root.replace('\\', '/').endswith('/labels') or '\\labels\\' in root:
+                    label_dirs.append(root)
+                elif os.path.basename(root) in ('train', 'val') and os.path.basename(os.path.dirname(root)) == 'labels':
+                    label_dirs.append(root)
+
         try:
-            # 查找包含.txt文件的目录
-            txt_dirs = []
-            for root, dirs, files in os.walk(self.train_dir):
-                if any(f.endswith('.txt') for f in files):
-                    txt_dirs.append(root)
-            
-            if not txt_dirs:
-                self.log_update.emit("未找到标签文件(.txt)")
-                return []
-            
-            # 收集所有出现的类ID
-            class_ids = set()
+            txt_dirs = list(dict.fromkeys(label_dirs))
             for txt_dir in txt_dirs:
-                for file in os.listdir(txt_dir):
-                    if file.endswith('.txt'):
-                        try:
-                            with open(os.path.join(txt_dir, file), 'r') as f:
-                                for line in f:
-                                    parts = line.strip().split()
-                                    if parts and parts[0].isdigit():
-                                        class_ids.add(int(parts[0]))
-                        except Exception:
-                            pass
-            
-            # 创建类名列表
-            if class_ids:
-                max_id = max(class_ids)
-                class_names = [f"class{i}" for i in range(max_id + 1)]
-                self.log_update.emit(f"从标签文件推断类名: 找到{len(class_names)}个类")
-                return class_names
-        
+                if not os.path.isdir(txt_dir):
+                    continue
+                max_class_id = -1
+                for name in os.listdir(txt_dir):
+                    if not name.endswith('.txt'):
+                        continue
+                    with open(os.path.join(txt_dir, name), 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if parts:
+                                max_class_id = max(max_class_id, int(float(parts[0])))
+                if max_class_id >= 0:
+                    self.log_update.emit(f"从标签目录推断类名: {txt_dir}")
+                    return [f'class{i}' for i in range(max_class_id + 1)]
         except Exception as e:
             self.log_update.emit(f"从标签文件推断类名失败: {str(e)}")
-        
+
         return []
-    
+
     def _get_coco_class_names(self):
         """从COCO格式数据集中提取类名"""
         try:
@@ -1347,7 +1727,7 @@ class TrainingWorker(QObject):
             
             # Extract unique class names from XML files
             class_names = set()
-            for xml_file in xml_files[:10]:  # Only parse a few files for efficiency
+            for xml_file in xml_files:  # 解析全部 XML，避免漏类
                 tree = ET.parse(xml_file)
                 root = tree.getroot()
                 for obj in root.findall('.//object'):

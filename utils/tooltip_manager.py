@@ -8,14 +8,14 @@ class TooltipManager:
     @staticmethod
     def apply_tooltips(window):
         """为主窗口的UI元素添加工具提示"""
-        # 设置工具提示全局字体
-        QToolTip.setFont(QFont('Segoe UI', 9))
+        QToolTip.setFont(QFont('Segoe UI', 11))
         
-        # 应用主窗口工具提示
         TooltipManager.apply_training_tab_tooltips(window.training_tab)
         TooltipManager.apply_testing_tab_tooltips(window.testing_tab)
         TooltipManager.apply_inference_tab_tooltips(window.inference_tab)
         TooltipManager.apply_settings_tab_tooltips(window.settings_tab)
+        if hasattr(window, 'annotation_tab'):
+            TooltipManager.apply_annotation_tab_tooltips(window.annotation_tab)
     
     @staticmethod
     def apply_training_tab_tooltips(tab):
@@ -23,27 +23,26 @@ class TooltipManager:
         if not tab:
             return
             
-        # 常用训练标签页控件的工具提示
-        if hasattr(tab, 'dataset_path_edit'):
-            tab.dataset_path_edit.setToolTip("指定数据集的路径<br><b>快捷键:</b> 无")
-            
+        if hasattr(tab, 'train_images_edit'):
+            tab.train_images_edit.setToolTip("训练图像目录（如 dataset/images/train）")
+        if hasattr(tab, 'train_labels_edit'):
+            tab.train_labels_edit.setToolTip("训练标签目录（如 dataset/labels/train）")
+        if hasattr(tab, 'val_images_edit'):
+            tab.val_images_edit.setToolTip("验证图像目录（如 dataset/images/val）")
+        if hasattr(tab, 'val_labels_edit'):
+            tab.val_labels_edit.setToolTip("验证标签目录（如 dataset/labels/val）")
         if hasattr(tab, 'model_combo'):
-            tab.model_combo.setToolTip("选择要训练的模型架构<br><b>快捷键:</b> 无")
-            
+            tab.model_combo.setToolTip("选择要训练的模型架构")
         if hasattr(tab, 'epochs_spin'):
-            tab.epochs_spin.setToolTip("训练的轮数<br><b>提示:</b> 较大的轮数通常能获得更好的结果，但需要更长的训练时间")
-            
+            tab.epochs_spin.setToolTip("训练轮数。越大通常效果越好，但耗时更长")
         if hasattr(tab, 'batch_size_spin'):
-            tab.batch_size_spin.setToolTip("每批次训练的样本数量<br><b>提示:</b> 较大的批量可以加速训练，但需要更多的GPU内存")
-            
-        if hasattr(tab, 'start_training_btn'):
-            tab.start_training_btn.setToolTip("开始训练模型<br><b>确保所有参数设置正确</b>")
-            
-        if hasattr(tab, 'stop_training_btn'):
-            tab.stop_training_btn.setToolTip("停止当前训练进程<br><b>警告:</b> 训练停止后无法恢复")
-            
-        if hasattr(tab, 'clear_log_btn'):
-            tab.clear_log_btn.setToolTip("清除训练日志<br><b>快捷键:</b> Ctrl+L")
+            tab.batch_size_spin.setToolTip("批次大小。越大越快，但更吃显存")
+        if hasattr(tab, 'img_size_spin'):
+            tab.img_size_spin.setToolTip("训练图像尺寸。高分辨率小缺陷可试 1280/1920")
+        if hasattr(tab, 'start_btn'):
+            tab.start_btn.setToolTip("开始训练模型")
+        if hasattr(tab, 'stop_btn'):
+            tab.stop_btn.setToolTip("停止当前训练（无法从断点恢复）")
     
     @staticmethod
     def apply_testing_tab_tooltips(tab):
@@ -51,24 +50,18 @@ class TooltipManager:
         if not tab:
             return
             
-        # 常用测试标签页控件的工具提示
-        if hasattr(tab, 'test_dataset_path_edit'):
-            tab.test_dataset_path_edit.setToolTip("指定测试数据集的路径<br><b>快捷键:</b> 无")
-            
+        if hasattr(tab, 'test_images_edit'):
+            tab.test_images_edit.setToolTip("测试图像目录")
+        if hasattr(tab, 'test_labels_edit'):
+            tab.test_labels_edit.setToolTip("测试标签目录（用于计算 mAP）")
         if hasattr(tab, 'model_path_edit'):
-            tab.model_path_edit.setToolTip("指定训练好的模型权重文件路径<br><b>提示:</b> 选择合适的模型权重以匹配您的测试数据")
-            
-        if hasattr(tab, 'conf_threshold_spin'):
-            tab.conf_threshold_spin.setToolTip("检测置信度阈值<br><b>提示:</b> 较高的值会减少误报，但可能会增加漏报")
-            
-        if hasattr(tab, 'start_testing_btn'):
-            tab.start_testing_btn.setToolTip("开始评估模型性能<br><b>确保所有参数设置正确</b>")
-            
-        if hasattr(tab, 'stop_testing_btn'):
-            tab.stop_testing_btn.setToolTip("停止当前测试进程<br><b>警告:</b> 测试停止后无法恢复")
-            
-        if hasattr(tab, 'clear_test_log_btn'):
-            tab.clear_test_log_btn.setToolTip("清除测试日志<br><b>快捷键:</b> Ctrl+L")
+            tab.model_path_edit.setToolTip("训练好的模型权重文件（.pt）")
+        if hasattr(tab, 'conf_thresh_spin'):
+            tab.conf_thresh_spin.setToolTip("检测置信度阈值。越高误报越少，漏报可能增多")
+        if hasattr(tab, 'start_btn'):
+            tab.start_btn.setToolTip("开始评估模型性能")
+        if hasattr(tab, 'stop_btn'):
+            tab.stop_btn.setToolTip("停止当前测试")
     
     @staticmethod
     def apply_inference_tab_tooltips(tab):
@@ -76,21 +69,14 @@ class TooltipManager:
         if not tab:
             return
             
-        # 常用推理标签页控件的工具提示
-        if hasattr(tab, 'inference_source_edit'):
-            tab.inference_source_edit.setToolTip("指定推理源（图像、视频或文件夹路径）<br><b>快捷键:</b> 无")
-            
-        if hasattr(tab, 'inference_model_path_edit'):
-            tab.inference_model_path_edit.setToolTip("指定用于推理的模型权重文件路径<br><b>提示:</b> 选择合适的模型以获得最佳结果")
-            
-        if hasattr(tab, 'start_inference_btn'):
-            tab.start_inference_btn.setToolTip("开始对选定的源进行推理<br><b>确保所有参数设置正确</b>")
-            
-        if hasattr(tab, 'stop_inference_btn'):
-            tab.stop_inference_btn.setToolTip("停止当前推理进程<br><b>警告:</b> 推理停止后无法恢复")
-            
-        if hasattr(tab, 'save_results_btn'):
-            tab.save_results_btn.setToolTip("保存推理结果<br><b>提示:</b> 结果将保存在指定的输出目录中")
+        if hasattr(tab, 'input_edit'):
+            tab.input_edit.setToolTip("推理源：图像、视频或文件夹路径")
+        if hasattr(tab, 'model_path_edit'):
+            tab.model_path_edit.setToolTip("用于推理的模型权重文件")
+        if hasattr(tab, 'start_btn'):
+            tab.start_btn.setToolTip("开始推理")
+        if hasattr(tab, 'stop_btn'):
+            tab.stop_btn.setToolTip("停止当前推理")
     
     @staticmethod
     def apply_settings_tab_tooltips(tab):
@@ -98,27 +84,45 @@ class TooltipManager:
         if not tab:
             return
             
-        # 常用设置标签页控件的工具提示
-        if hasattr(tab, 'device_combo'):
-            tab.device_combo.setToolTip("选择运行环境<br><b>提示:</b> GPU通常比CPU快很多")
-            
+        if hasattr(tab, 'use_gpu_check'):
+            tab.use_gpu_check.setToolTip("启用后训练/推理优先使用 GPU")
+        if hasattr(tab, 'gpu_device_spin'):
+            tab.gpu_device_spin.setToolTip("CUDA 设备编号，通常为 0")
         if hasattr(tab, 'output_dir_edit'):
-            tab.output_dir_edit.setToolTip("指定保存输出结果的目录<br><b>快捷键:</b> 无")
-            
-        if hasattr(tab, 'save_settings_btn'):
-            tab.save_settings_btn.setToolTip("保存当前设置<br><b>快捷键:</b> Ctrl+S")
-            
-        if hasattr(tab, 'reset_settings_btn'):
-            tab.reset_settings_btn.setToolTip("重置所有设置为默认值<br><b>警告:</b> 此操作无法撤销")
-            
-        if hasattr(tab, 'theme_combo') and tab.theme_combo:
-            tab.theme_combo.setToolTip("选择应用程序的主题<br><b>提示:</b> 暗色主题可减轻眼睛疲劳")
+            tab.output_dir_edit.setToolTip("默认输出目录")
+        if hasattr(tab, 'save_btn'):
+            tab.save_btn.setToolTip("保存当前设置<br><b>快捷键:</b> Ctrl+S")
+        if hasattr(tab, 'reset_btn'):
+            tab.reset_btn.setToolTip("重置所有设置为默认值")
+        if hasattr(tab, 'theme_combo'):
+            tab.theme_combo.setToolTip("选择应用程序主题")
     
+    @staticmethod
+    def apply_annotation_tab_tooltips(tab):
+        """为缺陷标注标签页添加工具提示"""
+        if not tab:
+            return
+        if hasattr(tab, 'export_btn'):
+            tab.export_btn.setToolTip("导出标准 YOLO 数据集（images/labels + data.yaml）")
+        if hasattr(tab, 'val_ratio_spin'):
+            tab.val_ratio_spin.setToolTip("导出时验证集占比")
+        if hasattr(tab, 'class_combo'):
+            tab.class_combo.setToolTip("当前画框使用的缺陷类别（快捷键 1-9）")
+        if hasattr(tab, 'roi_enabled_check'):
+            tab.roi_enabled_check.setToolTip(
+                "启用后，训练前会按归一化 ROI 裁剪全部训练/验证图像，并同步重映射标签"
+            )
+        if hasattr(tab, 'roi_pick_btn'):
+            tab.roi_pick_btn.setToolTip(
+                "在当前/样例图上拖拽框选全局 ROI（相对比例，对所有图生效）"
+            )
+        if hasattr(tab, 'roi_view_only_check'):
+            tab.roi_view_only_check.setToolTip(
+                "勾选后切换图像时仅显示全局 ROI 区域；标注仍按全图坐标保存"
+            )    
     @staticmethod
     def show_temporary_tooltip(widget, message, duration=3000):
         """显示临时的工具提示"""
         position = widget.mapToGlobal(widget.rect().topRight())
         QToolTip.showText(position, message, widget)
-        
-        # 创建定时器在指定时间后隐藏工具提示
-        QTimer.singleShot(duration, lambda: QToolTip.hideText()) 
+        QTimer.singleShot(duration, lambda: QToolTip.hideText())

@@ -4,7 +4,9 @@ from PyQt5.QtCore import Qt
 
 class ThemeManager:
     """管理应用程序主题的类，支持浅色、深色和科技感主题模式"""
-    
+
+    BASE_FONT_PT = 13
+
     @staticmethod
     def initialize():
         """初始化主题管理器"""
@@ -16,28 +18,53 @@ class ThemeManager:
             print(f"初始化主题管理器时出错: {str(e)}")
 
     @staticmethod
+    def apply_base_font(app):
+        """统一放大应用字体。"""
+        if app is None:
+            return
+        families = set(QFontDatabase().families())
+        family = 'Microsoft YaHei UI' if 'Microsoft YaHei UI' in families else 'Segoe UI'
+        app.setFont(QFont(family, ThemeManager.BASE_FONT_PT))
+
+    @staticmethod
     def apply_light_theme(app):
         """应用浅色主题到应用程序"""
         app.setStyle('Fusion')
-        app.setPalette(QPalette())  # 重置为默认浅色调色板
         
         # 设置主题属性
         app.setProperty('theme', 'light')
+        ThemeManager.apply_base_font(app)
+
+        # 显式浅色高亮：选中项用蓝底白字，普通项深色字，避免看不见
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(245, 245, 247))
+        palette.setColor(QPalette.WindowText, QColor(33, 33, 33))
+        palette.setColor(QPalette.Base, QColor(255, 255, 255))
+        palette.setColor(QPalette.AlternateBase, QColor(245, 245, 245))
+        palette.setColor(QPalette.Text, QColor(33, 33, 33))
+        palette.setColor(QPalette.Button, QColor(245, 245, 245))
+        palette.setColor(QPalette.ButtonText, QColor(33, 33, 33))
+        palette.setColor(QPalette.Highlight, QColor(66, 135, 245))
+        palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        app.setPalette(palette)
         
         # 设置基本样式表
         app.setStyleSheet("""
             QMainWindow, QDialog {
                 background-color: #F5F5F7;
+                color: #212121;
             }
             QWidget {
                 font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
+                font-size: 13pt;
+                color: #212121;
             }
             QToolTip { 
                 color: #333333; 
                 background-color: #F8F8F8; 
                 border: 1px solid #CCCCCC;
-                padding: 5px;
-                font-size: 11px;
+                padding: 6px 8px;
+                font-size: 12pt;
                 border-radius: 3px;
             }
             QTabWidget::pane {
@@ -48,14 +75,17 @@ class ThemeManager:
             QTabBar::tab {
                 background: #F0F0F0;
                 border: 1px solid #CCCCCC;
-                padding: 8px 15px;
+                padding: 10px 18px;
                 margin-right: 2px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
+                font-size: 13pt;
+                color: #212121;
             }
             QTabBar::tab:selected {
                 background: #FFFFFF;
                 border-bottom-color: #FFFFFF;
+                color: #212121;
             }
             QTabBar::tab:hover:!selected {
                 background-color: #E6E6E6;
@@ -63,9 +93,11 @@ class ThemeManager:
             QPushButton {
                 background-color: #F5F5F5;
                 border: 1px solid #CCCCCC;
-                padding: 6px 12px;
+                padding: 7px 14px;
                 border-radius: 4px;
-                min-height: 24px;
+                min-height: 28px;
+                font-size: 13pt;
+                color: #212121;
             }
             QPushButton:hover {
                 background-color: #E6E6E6;
@@ -74,11 +106,15 @@ class ThemeManager:
             QPushButton:pressed {
                 background-color: #D1D1D1;
             }
-            QTextEdit, QLineEdit {
+            QTextEdit, QLineEdit, QPlainTextEdit {
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
-                padding: 6px;
+                padding: 6px 8px;
                 background-color: #FFFFFF;
+                color: #212121;
+                font-size: 13pt;
+                selection-background-color: #4287f5;
+                selection-color: #FFFFFF;
             }
             QLineEdit:focus, QTextEdit:focus {
                 border: 1px solid #99C2FF;
@@ -86,11 +122,52 @@ class ThemeManager:
             QComboBox {
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
-                padding: 5px 10px;
+                padding: 6px 12px;
                 background-color: #FFFFFF;
+                color: #212121;
+                font-size: 13pt;
+                min-height: 28px;
             }
             QComboBox:hover {
                 border-color: #BBBBBB;
+            }
+            QComboBox:on {
+                color: #212121;
+                background-color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView {
+                border: 1px solid #CCCCCC;
+                background-color: #FFFFFF;
+                color: #212121;
+                outline: 0;
+                selection-background-color: #4287f5;
+                selection-color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView::item {
+                color: #212121;
+                min-height: 28px;
+                padding: 4px 8px;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #4287f5;
+                color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #E3F0FF;
+                color: #212121;
+            }
+            QListWidget, QTreeWidget, QTableWidget {
+                background-color: #FFFFFF;
+                color: #212121;
+                outline: 0;
+            }
+            QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {
+                background-color: #4287f5;
+                color: #FFFFFF;
+            }
+            QListWidget::item:hover, QTreeWidget::item:hover {
+                background-color: #E3F0FF;
+                color: #212121;
             }
             QComboBox::drop-down {
                 subcontrol-origin: padding;
@@ -98,22 +175,19 @@ class ThemeManager:
                 width: 20px;
                 border-left: 1px solid #CCCCCC;
             }
-            QComboBox QAbstractItemView {
-                border: 1px solid #CCCCCC;
-                background-color: #FFFFFF;
-                selection-background-color: #E6E6E6;
-            }
             QSpinBox, QDoubleSpinBox {
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
                 padding: 5px;
                 background-color: #FFFFFF;
+                color: #212121;
             }
             QProgressBar {
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
                 text-align: center;
                 height: 16px;
+                color: #212121;
             }
             QProgressBar::chunk {
                 background-color: #4287f5;
@@ -124,6 +198,7 @@ class ThemeManager:
                 border-radius: 4px;
                 margin-top: 12px;
                 padding-top: 15px;
+                color: #212121;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -161,6 +236,9 @@ class ThemeManager:
             QScrollBar::handle:horizontal:hover {
                 background: #AAAAAA;
             }
+            QRadioButton, QCheckBox, QLabel {
+                color: #212121;
+            }
         """)
     
     @staticmethod
@@ -170,6 +248,7 @@ class ThemeManager:
         
         # 设置主题属性
         app.setProperty('theme', 'dark')
+        ThemeManager.apply_base_font(app)
         
         # 设置深色调色板
         palette = QPalette()
@@ -202,27 +281,30 @@ class ThemeManager:
             }
             QWidget {
                 font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
+                font-size: 13pt;
             }
             QToolTip { 
                 color: #FFFFFF; 
                 background-color: #2D2D30; 
                 border: 1px solid #555555;
-                padding: 5px;
-                font-size: 11px;
+                padding: 6px 8px;
+                font-size: 12pt;
                 border-radius: 3px;
             }
             QTabWidget::pane {
-                border: 1px solid #444444;
+                border: 1px solid #3F3F46;
                 border-radius: 3px;
                 top: -1px;
             }
             QTabBar::tab {
                 background: #2D2D30;
-                border: 1px solid #444444;
-                padding: 8px 15px;
+                border: 1px solid #3F3F46;
+                padding: 10px 18px;
                 margin-right: 2px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
+                color: #DCDCDC;
+                font-size: 13pt;
             }
             QTabBar::tab:selected {
                 background: #3E3E42;
@@ -234,10 +316,11 @@ class ThemeManager:
             QPushButton {
                 background-color: #3E3E42;
                 border: 1px solid #555555;
-                padding: 6px 12px;
+                padding: 7px 14px;
                 color: #FFFFFF;
                 border-radius: 4px;
-                min-height: 24px;
+                min-height: 28px;
+                font-size: 13pt;
             }
             QPushButton:hover {
                 background-color: #505054;
@@ -357,6 +440,7 @@ class ThemeManager:
         
         # 设置主题属性
         app.setProperty('theme', 'tech')
+        ThemeManager.apply_base_font(app)
         
         # 设置科技感调色板
         palette = QPalette()
@@ -389,6 +473,7 @@ class ThemeManager:
                 color: #DCE6F0;
                 font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
                 font-weight: 400;
+                font-size: 13pt;
             }
             
             QMainWindow, QDialog {
@@ -399,8 +484,8 @@ class ThemeManager:
                 color: #DCE6F0; 
                 background-color: #1E2832; 
                 border: 1px solid #34465A;
-                padding: 6px;
-                font-size: 11px;
+                padding: 6px 8px;
+                font-size: 12pt;
                 border-radius: 3px;
             }
             
@@ -422,12 +507,13 @@ class ThemeManager:
             QTabBar::tab {
                 background: #1A2530;
                 border: 1px solid #34465A;
-                padding: 8px 16px;
+                padding: 10px 18px;
                 margin-right: 2px;
                 border-top-left-radius: 5px;
                 border-top-right-radius: 5px;
                 color: #B0C0D0;
                 font-weight: 500;
+                font-size: 13pt;
             }
             
             QTabBar::tab:selected {

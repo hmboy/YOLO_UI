@@ -23,6 +23,8 @@ def main():
         
         # 创建应用程序
         app = QApplication(sys.argv)
+        ThemeManager.initialize()
+        ThemeManager.apply_base_font(app)
         
         # 创建主窗口（但尚未显示）
         window = MainWindow()

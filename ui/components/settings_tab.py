@@ -34,21 +34,31 @@ class SettingsTab(QWidget):
             'default_output_dir': '',
             'default_train_model_path': '',
             'default_test_model_path': '',
-            'theme': 'tech',  # 默认主题为科技感主题
+            'theme': 'light',  # 默认浅色主题
             'default_train_images_dir': '',
             'default_train_labels_dir': '',
             'default_val_images_dir': '',
             'default_val_labels_dir': '',
             'default_test_images_dir': '',
-            'default_test_labels_dir': ''
+            'default_test_labels_dir': '',
+            'last_annotation_project': '',
+            # 全局训练 ROI（归一化 0-1，对所有图像按比例裁剪）
+            'roi_enabled': False,
+            'roi_x1': 0.0,
+            'roi_y1': 0.0,
+            'roi_x2': 1.0,
+            'roi_y2': 1.0,
+            'roi_preview_image': '',
+            'roi_view_only': False,
         }
         
         # Load settings if available
         self.settings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'settings.json')
-        self.load_settings()
-        
+        self.load_settings_from_file()
+
         # Set up UI
         self.setup_ui()
+        self.apply_settings_to_ui()
     
     def setup_ui(self):
         """Create and arrange UI elements."""
@@ -84,7 +94,9 @@ class SettingsTab(QWidget):
         self.model_combo = QComboBox()
         self.model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
                                   "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x",
-                                  "yolo12n", "yolo12s", "yolo12m", "yolo12l", "yolo12x"])
+                                  "yolo12n", "yolo12s", "yolo12m", "yolo12l", "yolo12x",
+                                  "yolo11m", "yolo11l",
+                                  "yolo11m-seg", "yolo11l-seg"])
         index = self.model_combo.findText(self.settings['default_model'])
         if index >= 0:
             self.model_combo.setCurrentIndex(index)
@@ -125,30 +137,6 @@ class SettingsTab(QWidget):
         paths_group = QGroupBox("默认目录")
         paths_form_layout = QFormLayout()
         
-        # Training data path
-        self.train_dir_layout = QHBoxLayout()
-        self.train_dir_edit = QLineEdit(self.settings['default_train_dir'])
-        self.train_dir_edit.setReadOnly(False)
-        self.train_dir_btn = QPushButton("浏览...")
-        self.train_dir_layout.addWidget(self.train_dir_edit)
-        self.train_dir_layout.addWidget(self.train_dir_btn)
-        
-        # Validation data path
-        self.val_dir_layout = QHBoxLayout()
-        self.val_dir_edit = QLineEdit(self.settings['default_val_dir'])
-        self.val_dir_edit.setReadOnly(False)
-        self.val_dir_btn = QPushButton("浏览...")
-        self.val_dir_layout.addWidget(self.val_dir_edit)
-        self.val_dir_layout.addWidget(self.val_dir_btn)
-        
-        # Test data path
-        self.test_dir_layout = QHBoxLayout()
-        self.test_dir_edit = QLineEdit(self.settings['default_test_dir'])
-        self.test_dir_edit.setReadOnly(False)
-        self.test_dir_btn = QPushButton("浏览...")
-        self.test_dir_layout.addWidget(self.test_dir_edit)
-        self.test_dir_layout.addWidget(self.test_dir_btn)
-        
         # Output path
         self.output_dir_layout = QHBoxLayout()
         self.output_dir_edit = QLineEdit(self.settings['default_output_dir'])
@@ -173,7 +161,7 @@ class SettingsTab(QWidget):
         self.test_model_layout.addWidget(self.test_model_edit)
         self.test_model_layout.addWidget(self.test_model_btn)
         
-        # 新增：默认训练图像目录
+        # 默认训练图像目录
         self.default_train_images_layout = QHBoxLayout()
         self.default_train_images_edit = QLineEdit(self.settings.get('default_train_images_dir', ''))
         self.default_train_images_edit.setReadOnly(False)
@@ -194,7 +182,7 @@ class SettingsTab(QWidget):
         # 新增：默认验证图像目录
         self.default_val_images_layout = QHBoxLayout()
         self.default_val_images_edit = QLineEdit(self.settings.get('default_val_images_dir', ''))
-        self.default_val_images_edit.setReadOnly(True)
+        self.default_val_images_edit.setReadOnly(False)
         self.default_val_images_btn = QPushButton("浏览...")
         self.default_val_images_layout.addWidget(self.default_val_images_edit)
         self.default_val_images_layout.addWidget(self.default_val_images_btn)
@@ -244,9 +232,12 @@ class SettingsTab(QWidget):
         self.batch_size_spin.setValue(self.settings['default_batch_size'])
         
         self.img_size_spin = QSpinBox()
-        self.img_size_spin.setRange(32, 1280)
+        self.img_size_spin.setRange(32, 8192)
         self.img_size_spin.setValue(self.settings['default_img_size'])
         self.img_size_spin.setSingleStep(32)
+        self.img_size_spin.setToolTip(
+            "默认图像尺寸上限已支持至 8192。使用 2048/4096 时请减小批次大小以防显存不足。"
+        )
         
         training_layout.addRow("默认批次大小:", self.batch_size_spin)
         training_layout.addRow("默认图像尺寸:", self.img_size_spin)
@@ -302,9 +293,6 @@ class SettingsTab(QWidget):
         self.theme_combo.currentIndexChanged.connect(self.apply_theme)
         
         # Connect path selection buttons
-        self.train_dir_btn.clicked.connect(self.select_train_dir)
-        self.val_dir_btn.clicked.connect(self.select_val_dir)
-        self.test_dir_btn.clicked.connect(self.select_test_dir)
         self.output_dir_btn.clicked.connect(self.select_output_dir)
         self.train_model_btn.clicked.connect(self.select_train_model)
         self.test_model_btn.clicked.connect(self.select_test_model)
@@ -337,24 +325,6 @@ class SettingsTab(QWidget):
         # 发送主题已更改的信号
         self.theme_changed.emit(self.settings['theme'])
     
-    def select_train_dir(self):
-        """Open dialog to select training data directory."""
-        dir_path = QFileDialog.getExistingDirectory(self, "选择默认训练数据目录")
-        if dir_path:
-            self.train_dir_edit.setText(dir_path)
-    
-    def select_val_dir(self):
-        """Open dialog to select validation data directory."""
-        dir_path = QFileDialog.getExistingDirectory(self, "选择默认验证数据目录")
-        if dir_path:
-            self.val_dir_edit.setText(dir_path)
-    
-    def select_test_dir(self):
-        """Open dialog to select test data directory."""
-        dir_path = QFileDialog.getExistingDirectory(self, "选择默认测试数据目录")
-        if dir_path:
-            self.test_dir_edit.setText(dir_path)
-    
     def select_output_dir(self):
         """Open dialog to select output directory."""
         dir_path = QFileDialog.getExistingDirectory(self, "选择默认输出目录")
@@ -382,7 +352,7 @@ class SettingsTab(QWidget):
         if dir_path:
             line_edit.setText(dir_path)
     
-    def save_settings(self):
+    def save_settings(self, show_message=True):
         """Save current settings to file and emit signal to update other tabs."""
         # Update settings dict from UI
         self.settings['default_model'] = self.model_combo.currentText()
@@ -402,83 +372,112 @@ class SettingsTab(QWidget):
         else:
             self.settings['theme'] = 'tech'
         
-        # Update path settings
-        self.settings['default_train_dir'] = self.train_dir_edit.text()
-        self.settings['default_val_dir'] = self.val_dir_edit.text()
-        self.settings['default_test_dir'] = self.test_dir_edit.text()
-        self.settings['default_output_dir'] = self.output_dir_edit.text()
-        self.settings['default_train_model_path'] = self.train_model_edit.text()
-        self.settings['default_test_model_path'] = self.test_model_edit.text()
-        
-        # 新增：默认训练图像目录
+        # Update path settings (legacy keys kept in sync with new image/label dirs)
         self.settings['default_train_images_dir'] = self.default_train_images_edit.text()
         self.settings['default_train_labels_dir'] = self.default_train_labels_edit.text()
         self.settings['default_val_images_dir'] = self.default_val_images_edit.text()
         self.settings['default_val_labels_dir'] = self.default_val_labels_edit.text()
         self.settings['default_test_images_dir'] = self.default_test_images_edit.text()
         self.settings['default_test_labels_dir'] = self.default_test_labels_edit.text()
+        self.settings['default_train_dir'] = self.settings['default_train_images_dir']
+        self.settings['default_val_dir'] = self.settings['default_val_images_dir']
+        self.settings['default_test_dir'] = self.settings['default_test_images_dir']
+        self.settings['default_output_dir'] = self.output_dir_edit.text()
+        self.settings['default_train_model_path'] = self.train_model_edit.text()
+        self.settings['default_test_model_path'] = self.test_model_edit.text()
+        # last_annotation_project 由标注页维护，此处保留已有值
+        if 'last_annotation_project' not in self.settings:
+            self.settings['last_annotation_project'] = ''
+
+        # 全局 ROI（UI 在缺陷标注页；此处只持久化已有值）
+        self.settings['roi_enabled'] = bool(self.settings.get('roi_enabled', False))
+        self.settings['roi_x1'] = float(self.settings.get('roi_x1', 0.0))
+        self.settings['roi_y1'] = float(self.settings.get('roi_y1', 0.0))
+        self.settings['roi_x2'] = float(self.settings.get('roi_x2', 1.0))
+        self.settings['roi_y2'] = float(self.settings.get('roi_y2', 1.0))
+        self.settings['roi_preview_image'] = self.settings.get('roi_preview_image', '') or ''
+        self.settings['roi_view_only'] = bool(self.settings.get('roi_view_only', False))
         
         # Save to file
         try:
             # Ensure data directory exists
             os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
             
-            with open(self.settings_file, 'w') as f:
-                json.dump(self.settings, f, indent=4)
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=4, ensure_ascii=False)
             
             # Notify other tabs
             self.settings_updated.emit(self.settings)
-            
-            QMessageBox.information(self, "设置已保存", "设置已成功保存。")
+
+            if show_message:
+                QMessageBox.information(self, "设置已保存", "设置已成功保存。")
         
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存设置失败: {str(e)}")
     
+    def load_settings_from_file(self):
+        """Load settings dict from file without touching UI widgets."""
+        if not os.path.exists(self.settings_file):
+            return
+        try:
+            with open(self.settings_file, 'r', encoding='utf-8') as f:
+                loaded_settings = json.load(f)
+            for key, value in loaded_settings.items():
+                if key in self.settings:
+                    self.settings[key] = value
+        except Exception as e:
+            print(f"加载设置文件时出错: {str(e)}")
+
+    def apply_settings_to_ui(self):
+        """Apply loaded settings to UI widgets."""
+        if not hasattr(self, 'model_combo'):
+            return
+
+        index = self.model_combo.findText(self.settings['default_model'])
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+
+        self.batch_size_spin.setValue(self.settings['default_batch_size'])
+        self.img_size_spin.setValue(self.settings['default_img_size'])
+        self.conf_thresh_spin.setValue(self.settings['default_conf_thresh'])
+        self.iou_thresh_spin.setValue(self.settings['default_iou_thresh'])
+        self.use_gpu_check.setChecked(self.settings['use_gpu'])
+        self.gpu_device_spin.setValue(self.settings['gpu_device'])
+        self.gpu_device_spin.setEnabled(self.settings['use_gpu'])
+
+        self.output_dir_edit.setText(self.settings['default_output_dir'])
+        self.train_model_edit.setText(self.settings['default_train_model_path'])
+        self.test_model_edit.setText(self.settings['default_test_model_path'])
+
+        theme = self.settings.get('theme', 'light')
+        if theme == 'light':
+            theme_index = 0
+        elif theme == 'dark':
+            theme_index = 1
+        else:
+            theme_index = 2
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(theme_index)
+        self.theme_combo.blockSignals(False)
+
+        # Prefer new keys; fall back to legacy default_*_dir
+        self.default_train_images_edit.setText(
+            self.settings.get('default_train_images_dir') or self.settings.get('default_train_dir', '')
+        )
+        self.default_train_labels_edit.setText(self.settings.get('default_train_labels_dir', ''))
+        self.default_val_images_edit.setText(
+            self.settings.get('default_val_images_dir') or self.settings.get('default_val_dir', '')
+        )
+        self.default_val_labels_edit.setText(self.settings.get('default_val_labels_dir', ''))
+        self.default_test_images_edit.setText(
+            self.settings.get('default_test_images_dir') or self.settings.get('default_test_dir', '')
+        )
+        self.default_test_labels_edit.setText(self.settings.get('default_test_labels_dir', ''))
+
     def load_settings(self):
-        """Load settings from file if it exists."""
-        if os.path.exists(self.settings_file):
-            try:
-                with open(self.settings_file, 'r') as f:
-                    loaded_settings = json.load(f)
-                
-                # Update settings with loaded values
-                for key, value in loaded_settings.items():
-                    if key in self.settings:
-                        self.settings[key] = value
-                
-                # Update UI
-                self.model_combo.setCurrentText(self.settings['default_model'])
-                self.batch_size_spin.setValue(self.settings['default_batch_size'])
-                self.img_size_spin.setValue(self.settings['default_img_size'])
-                self.conf_thresh_spin.setValue(self.settings['default_conf_thresh'])
-                self.iou_thresh_spin.setValue(self.settings['default_iou_thresh'])
-                self.use_gpu_check.setChecked(self.settings['use_gpu'])
-                self.gpu_device_spin.setValue(self.settings['gpu_device'])
-                self.train_dir_edit.setText(self.settings['default_train_dir'])
-                self.val_dir_edit.setText(self.settings['default_val_dir'])
-                self.test_dir_edit.setText(self.settings['default_test_dir'])
-                self.output_dir_edit.setText(self.settings['default_output_dir'])
-                self.train_model_edit.setText(self.settings['default_train_model_path'])
-                self.test_model_edit.setText(self.settings['default_test_model_path'])
-                self.theme_combo.setCurrentIndex(2)  # 设置为科技感主题
-                
-                # 应用默认主题
-                app = QApplication.instance()
-                ThemeManager.apply_tech_theme(app)
-                
-                # 新增：默认训练图像目录
-                self.default_train_images_edit.setText(self.settings.get('default_train_images_dir', ''))
-                self.default_train_labels_edit.setText(self.settings.get('default_train_labels_dir', ''))
-                self.default_val_images_edit.setText(self.settings.get('default_val_images_dir', ''))
-                self.default_val_labels_edit.setText(self.settings.get('default_val_labels_dir', ''))
-                self.default_test_images_edit.setText(self.settings.get('default_test_images_dir', ''))
-                self.default_test_labels_edit.setText(self.settings.get('default_test_labels_dir', ''))
-                
-                # Save to file and notify other tabs
-                self.save_settings()
-            
-            except Exception as e:
-                print(f"加载设置时出错: {str(e)}")
+        """Reload settings from file and refresh UI."""
+        self.load_settings_from_file()
+        self.apply_settings_to_ui()
     
     def reset_settings(self):
         """Reset settings to default values."""
@@ -504,42 +503,21 @@ class SettingsTab(QWidget):
                 'default_output_dir': '',
                 'default_train_model_path': '',
                 'default_test_model_path': '',
-                'theme': 'tech',  # 默认重置为科技感主题
+                'theme': 'light',  # 默认重置为浅色主题
                 'default_train_images_dir': '',
                 'default_train_labels_dir': '',
                 'default_val_images_dir': '',
                 'default_val_labels_dir': '',
                 'default_test_images_dir': '',
-                'default_test_labels_dir': ''
+                'default_test_labels_dir': '',
+                'last_annotation_project': '',
+                'roi_enabled': False,
+                'roi_x1': 0.0,
+                'roi_y1': 0.0,
+                'roi_x2': 1.0,
+                'roi_y2': 1.0,
+                'roi_preview_image': '',
+                'roi_view_only': False,
             }
-            
-            # Update UI
-            self.model_combo.setCurrentText(self.settings['default_model'])
-            self.batch_size_spin.setValue(self.settings['default_batch_size'])
-            self.img_size_spin.setValue(self.settings['default_img_size'])
-            self.conf_thresh_spin.setValue(self.settings['default_conf_thresh'])
-            self.iou_thresh_spin.setValue(self.settings['default_iou_thresh'])
-            self.use_gpu_check.setChecked(self.settings['use_gpu'])
-            self.gpu_device_spin.setValue(self.settings['gpu_device'])
-            self.train_dir_edit.setText(self.settings['default_train_dir'])
-            self.val_dir_edit.setText(self.settings['default_val_dir'])
-            self.test_dir_edit.setText(self.settings['default_test_dir'])
-            self.output_dir_edit.setText(self.settings['default_output_dir'])
-            self.train_model_edit.setText(self.settings['default_train_model_path'])
-            self.test_model_edit.setText(self.settings['default_test_model_path'])
-            self.theme_combo.setCurrentIndex(2)  # 设置为科技感主题
-            
-            # 应用默认主题
-            app = QApplication.instance()
-            ThemeManager.apply_tech_theme(app)
-            
-            # 新增：默认训练图像目录
-            self.default_train_images_edit.setText(self.settings['default_train_images_dir'])
-            self.default_train_labels_edit.setText(self.settings['default_train_labels_dir'])
-            self.default_val_images_edit.setText(self.settings['default_val_images_dir'])
-            self.default_val_labels_edit.setText(self.settings['default_val_labels_dir'])
-            self.default_test_images_edit.setText(self.settings['default_test_images_dir'])
-            self.default_test_labels_edit.setText(self.settings['default_test_labels_dir'])
-            
-            # Save to file and notify other tabs
-            self.save_settings()
+            self.apply_settings_to_ui()
+            self.save_settings(show_message=True)

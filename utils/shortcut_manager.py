@@ -20,11 +20,13 @@ class ShortcutManager:
         self.add_shortcut("Ctrl+Tab", self.next_tab, "切换到下一个标签页")
         self.add_shortcut("Ctrl+Shift+Tab", self.prev_tab, "切换到上一个标签页")
         
-        # 标签页快捷键
-        self.add_shortcut("Ctrl+1", lambda: self.set_tab_index(0), "切换到训练标签页")
-        self.add_shortcut("Ctrl+2", lambda: self.set_tab_index(1), "切换到测试标签页")
-        self.add_shortcut("Ctrl+3", lambda: self.set_tab_index(2), "切换到推理标签页")
-        self.add_shortcut("Ctrl+4", lambda: self.set_tab_index(3), "切换到设置标签页")
+        # 标签页快捷键（与 main_window 中的 Tab 顺序一致）
+        self.add_shortcut("Ctrl+1", lambda: self.set_tab_index(0), "切换到缺陷标注标签页")
+        self.add_shortcut("Ctrl+2", lambda: self.set_tab_index(1), "切换到训练标签页")
+        self.add_shortcut("Ctrl+3", lambda: self.set_tab_index(2), "切换到测试标签页")
+        self.add_shortcut("Ctrl+4", lambda: self.set_tab_index(3), "切换到推理标签页")
+        self.add_shortcut("Ctrl+5", lambda: self.set_tab_index(4), "切换到数据集转换标签页")
+        self.add_shortcut("Ctrl+6", lambda: self.set_tab_index(5), "切换到设置标签页")
         
         # 常用操作快捷键
         self.add_shortcut("Ctrl+S", self.save_settings, "保存设置")
@@ -80,23 +82,24 @@ class ShortcutManager:
         
         help_dialog.exec_()
     
+    def _tab_for_index(self, index):
+        """按索引返回对应标签页控件。"""
+        mapping = {
+            0: getattr(self.main_window, 'annotation_tab', None),
+            1: getattr(self.main_window, 'training_tab', None),
+            2: getattr(self.main_window, 'testing_tab', None),
+            3: getattr(self.main_window, 'inference_tab', None),
+            4: getattr(self.main_window, 'dataset_converter_tab', None),
+            5: getattr(self.main_window, 'settings_tab', None),
+        }
+        return mapping.get(index)
+
     def refresh_ui(self):
-        """刷新UI界面"""
-        # 获取当前标签页索引
+        """刷新当前标签页界面"""
         current_tab = self.main_window.tab_widget.currentIndex()
-        # 刷新当前标签页
-        if current_tab == 0:  # 训练标签页
-            if hasattr(self.main_window.training_tab, 'refresh'):
-                self.main_window.training_tab.refresh()
-        elif current_tab == 1:  # 测试标签页
-            if hasattr(self.main_window.testing_tab, 'refresh'):
-                self.main_window.testing_tab.refresh()
-        elif current_tab == 2:  # 推理标签页
-            if hasattr(self.main_window.inference_tab, 'refresh'):
-                self.main_window.inference_tab.refresh()
-        elif current_tab == 3:  # 设置标签页
-            if hasattr(self.main_window.settings_tab, 'refresh'):
-                self.main_window.settings_tab.refresh()
+        tab = self._tab_for_index(current_tab)
+        if tab is not None and hasattr(tab, 'refresh'):
+            tab.refresh()
     
     def next_tab(self):
         """切换到下一个标签页"""
@@ -121,18 +124,19 @@ class ShortcutManager:
             self.main_window.settings_tab.save_settings()
     
     def clear_console(self):
-        """清除控制台输出"""
+        """清除当前标签页控制台输出"""
         current_tab = self.main_window.tab_widget.currentIndex()
-        if current_tab == 0 and hasattr(self.main_window.training_tab, 'clear_log'):
-            self.main_window.training_tab.clear_log()
-        elif current_tab == 1 and hasattr(self.main_window.testing_tab, 'clear_log'):
-            self.main_window.testing_tab.clear_log()
-        elif current_tab == 2 and hasattr(self.main_window.inference_tab, 'clear_log'):
-            self.main_window.inference_tab.clear_log()
+        tab = self._tab_for_index(current_tab)
+        if tab is None:
+            return
+        if hasattr(tab, 'clear_terminal'):
+            tab.clear_terminal()
+        elif hasattr(tab, 'clear_log'):
+            tab.clear_log()
     
     def toggle_fullscreen(self):
         """切换全屏模式"""
         if self.main_window.isFullScreen():
             self.main_window.showNormal()
         else:
-            self.main_window.showFullScreen() 
+            self.main_window.showFullScreen()

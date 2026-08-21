@@ -11,7 +11,6 @@ from PyQt5.QtGui import QColor, QFont, QDesktopServices
 
 from utils.training_worker import TrainingWorker
 from utils.data_validator import validate_yolo_dataset, inspect_dataset_structure
-from utils.theme_manager import ThemeManager
 
 class TrainingTab(QWidget):
     """Tab for YOLO model training configuration and execution."""
@@ -126,7 +125,9 @@ class TrainingTab(QWidget):
         self.model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
                                   "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x",
                                   "yolo12n", "yolo12s", "yolo12m", "yolo12l", "yolo12x",
-                                  "yolo11n-obb", "yolo11s-obb", "yolo11m-obb", "yolo11l-obb", "yolo11x-obb"])
+                                  "yolo11n-obb", "yolo11s-obb", "yolo11m-obb", "yolo11l-obb", "yolo11x-obb",
+                                  "yolo11m", "yolo11l",
+                                  "yolo11m-seg", "yolo11l-seg"])
         
         # Model Initialization Options
         init_group_box = QGroupBox("模型初始化")
@@ -175,13 +176,17 @@ class TrainingTab(QWidget):
         self.batch_size_spin.setValue(16)
         
         self.epochs_spin = QSpinBox()
-        self.epochs_spin.setRange(1, 1000)
+        self.epochs_spin.setRange(1, 10000)
         self.epochs_spin.setValue(100)
         
         self.img_size_spin = QSpinBox()
-        self.img_size_spin.setRange(32, 1280)
+        self.img_size_spin.setRange(32, 8192)
         self.img_size_spin.setValue(640)
         self.img_size_spin.setSingleStep(32)
+        self.img_size_spin.setToolTip(
+            "训练时缩放到的边长（建议为 32 的倍数）。\n"
+            "大尺寸如 2048/4096 能保留更多细节，但显存占用显著增加，请适当减小批次大小。"
+        )
         
         self.lr_spin = QDoubleSpinBox()
         self.lr_spin.setRange(0.00001, 0.1)
@@ -238,6 +243,8 @@ class TrainingTab(QWidget):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat('%v / %m epoch')
+        self.progress_bar.setTextVisible(True)
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -307,18 +314,6 @@ class TrainingTab(QWidget):
             self.fine_tuning_mode.setChecked(False)
             self.log_message("从头开始训练不支持微调模式，已禁用微调")
     
-    def select_train_dir(self):
-        """Open dialog to select training data directory."""
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Training Data Directory")
-        if dir_path:
-            self.train_dir_edit.setText(dir_path)
-    
-    def select_val_dir(self):
-        """Open dialog to select validation data directory."""
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Validation Data Directory")
-        if dir_path:
-            self.val_dir_edit.setText(dir_path)
-    
     def select_output_dir(self):
         """Open dialog to select output directory."""
         dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -378,6 +373,14 @@ class TrainingTab(QWidget):
             fine_tuning = False
         
         # Create worker instance
+        settings_tab = self._find_settings_tab()
+        settings = settings_tab.settings if settings_tab else {}
+
+        epochs = self.epochs_spin.value()
+        self.progress_bar.setRange(0, max(1, epochs))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat('%v / %m epoch')
+
         self.training_worker = TrainingWorker(
             model_type=self.model_combo.currentText(),
             train_dir=self.train_images_edit.text(),
@@ -386,12 +389,24 @@ class TrainingTab(QWidget):
             project_name=self.project_name_edit.text(),
             dataset_format=self.dataset_format,
             batch_size=self.batch_size_spin.value(),
-            epochs=self.epochs_spin.value(),
+            epochs=epochs,
             img_size=self.img_size_spin.value(),
             learning_rate=self.lr_spin.value(),
             pretrained=pretrained,
             model_weights=model_weights,
-            fine_tuning=fine_tuning
+            fine_tuning=fine_tuning,
+            train_labels_dir=self.train_labels_edit.text(),
+            val_labels_dir=self.val_labels_edit.text(),
+            use_gpu=settings.get('use_gpu', True),
+            gpu_device=settings.get('gpu_device', 0),
+            export_onnx=True,
+            roi_enabled=bool(settings.get('roi_enabled', False)),
+            roi_norm=(
+                float(settings.get('roi_x1', 0.0)),
+                float(settings.get('roi_y1', 0.0)),
+                float(settings.get('roi_x2', 1.0)),
+                float(settings.get('roi_y2', 1.0)),
+            ),
         )
         
         self.training_thread = QThread()
@@ -401,6 +416,7 @@ class TrainingTab(QWidget):
         self.training_worker.progress_update.connect(self.update_progress)
         self.training_worker.log_update.connect(self.log_message)
         self.training_worker.training_complete.connect(self.on_training_complete)
+        self.training_worker.training_stopped.connect(self.on_training_stopped)
         self.training_worker.training_error.connect(self.on_training_error)
         self.training_thread.started.connect(self.training_worker.run)
         
@@ -420,6 +436,16 @@ class TrainingTab(QWidget):
         self.set_ui_enabled(True)
         self.log_message("训练成功完成！")
         QMessageBox.information(self, "训练完成", "训练已成功完成。")
+
+    def on_training_stopped(self):
+        """Handle user-initiated training stop."""
+        if not self.is_training and self.training_thread is None:
+            return
+        self.is_training = False
+        self.clean_up_thread()
+        self.set_ui_enabled(True)
+        self.log_message("训练已停止。")
+        QMessageBox.information(self, "训练已停止", "训练已被用户中止。")
     
     def on_training_error(self, error_msg):
         """Handle training error."""
@@ -460,6 +486,10 @@ class TrainingTab(QWidget):
         # Also print to stdout for terminal redirection
         print(f"[Training] {message}")
     
+    def clear_terminal(self):
+        """清除训练日志输出"""
+        self.log_text.clear()
+
     def set_ui_enabled(self, enabled):
         """Enable or disable UI elements during training."""
         self.start_btn.setEnabled(enabled)
@@ -594,25 +624,28 @@ class TrainingTab(QWidget):
         dir_path = QFileDialog.getExistingDirectory(self, title)
         if dir_path:
             line_edit.setText(dir_path)
-            # 自动同步到设置页
-            from ui.main_window import MainWindow
-            main_window = self.parentWidget()
-            while main_window and not isinstance(main_window, MainWindow):
-                main_window = main_window.parentWidget()
-            if main_window and hasattr(main_window, 'settings_tab'):
-                settings_tab = main_window.settings_tab
-                # 根据line_edit对象同步到对应设置项
-                if line_edit is self.train_images_edit:
-                    settings_tab.default_train_images_edit.setText(dir_path)
-                elif line_edit is self.train_labels_edit:
-                    settings_tab.default_train_labels_edit.setText(dir_path)
-                elif line_edit is self.val_images_edit:
-                    settings_tab.default_val_images_edit.setText(dir_path)
-                elif line_edit is self.val_labels_edit:
-                    settings_tab.default_val_labels_edit.setText(dir_path)
-                # 实时保存
-                settings_tab.save_settings()
-    
+            settings_tab = self._find_settings_tab()
+            if settings_tab is None:
+                return
+            if line_edit is self.train_images_edit:
+                settings_tab.default_train_images_edit.setText(dir_path)
+            elif line_edit is self.train_labels_edit:
+                settings_tab.default_train_labels_edit.setText(dir_path)
+            elif line_edit is self.val_images_edit:
+                settings_tab.default_val_images_edit.setText(dir_path)
+            elif line_edit is self.val_labels_edit:
+                settings_tab.default_val_labels_edit.setText(dir_path)
+            settings_tab.save_settings(show_message=False)
+
+    def _find_settings_tab(self):
+        """沿父级查找 settings_tab，避免导入 MainWindow 造成循环依赖。"""
+        parent = self.parentWidget()
+        while parent is not None:
+            if hasattr(parent, 'settings_tab'):
+                return parent.settings_tab
+            parent = parent.parentWidget()
+        return None
+
     def validate_dataset(self):
         """Validate the dataset structure and image-label matching."""
         # Get the directory paths
@@ -624,6 +657,16 @@ class TrainingTab(QWidget):
         # Check if paths are provided
         if not train_images_dir:
             QMessageBox.warning(self, "缺少路径", "请先选择训练图像目录")
+            return
+
+        if '\\labels\\' in train_images_dir.replace('/', '\\') or '/labels/' in train_images_dir.replace('\\', '/'):
+            QMessageBox.warning(
+                self, "路径可能有误",
+                "「训练图像目录」似乎指向了 labels 目录。\n\n"
+                "应填写 images/train，例如:\n"
+                "  .../dataset/images/train\n\n"
+                "labels/train 请填在「训练标签目录」中。"
+            )
             return
             
         # Validate the training dataset

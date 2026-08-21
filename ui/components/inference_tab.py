@@ -74,9 +74,12 @@ class InferenceTab(QWidget):
         
         # Image size
         self.img_size_spin = QSpinBox()
-        self.img_size_spin.setRange(32, 1280)
+        self.img_size_spin.setRange(32, 8192)
         self.img_size_spin.setValue(640)
         self.img_size_spin.setSingleStep(32)
+        self.img_size_spin.setToolTip(
+            "推理时的图像边长（建议为 32 的倍数）。大尺寸显存占用更高。"
+        )
         
         # Add widgets to form layout
         model_layout.addRow("模型路径:", self.model_path_layout)
@@ -194,7 +197,7 @@ class InferenceTab(QWidget):
         image_header_layout.setContentsMargins(0, 0, 0, 5)
         
         image_title = QLabel("检测结果预览")
-        image_title.setFont(QFont("", 11, QFont.Bold))
+        image_title.setFont(QFont("", 13, QFont.Bold))
         image_header_layout.addWidget(image_title)
         
         self.save_img_btn = QPushButton("保存图片")
@@ -301,7 +304,7 @@ class InferenceTab(QWidget):
         terminal_header_layout.setContentsMargins(0, 0, 0, 5)
         
         terminal_title = QLabel("终端输出")
-        terminal_title.setFont(QFont("", 11, QFont.Bold))
+        terminal_title.setFont(QFont("", 13, QFont.Bold))
         terminal_header_layout.addWidget(terminal_title)
         
         clear_btn = QPushButton("清除")
