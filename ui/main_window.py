@@ -17,6 +17,7 @@ from ui.components.dataset_converter_tab import DatasetConverterTab
 from ui.components.annotation_tab import AnnotationTab
 from utils.terminal_redirect import TerminalManager
 from utils.theme_manager import ThemeManager
+from utils.app_paths import assets_dir
 
 class MainWindow(QMainWindow):
     """Main application window containing all interface elements."""
@@ -122,8 +123,7 @@ class MainWindow(QMainWindow):
     
     def set_app_icon(self):
         """设置应用程序图标"""
-        # SVG图标路径
-        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui/assets/app_icon.svg")
+        icon_path = os.path.join(assets_dir(), "app_icon.svg")
         
         try:
             # 从SVG文件创建图标
@@ -146,17 +146,17 @@ class MainWindow(QMainWindow):
     
     def setup_tab_icons(self):
         """为标签页设置图标"""
-        assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui/assets")
+        icons_root = assets_dir()
         
         # 设置标签页图标
         try:
             # 使用SVG图标
-            train_icon = self.create_icon_from_svg(os.path.join(assets_dir, "train_icon.svg"))
-            test_icon = self.create_icon_from_svg(os.path.join(assets_dir, "test_icon.svg"))
-            inference_icon = self.create_icon_from_svg(os.path.join(assets_dir, "inference_icon.svg"))
-            annotation_icon = self.create_icon_from_svg(os.path.join(assets_dir, "annotation_icon.svg"))
-            settings_icon = self.create_icon_from_svg(os.path.join(assets_dir, "settings_icon.svg"))
-            converter_icon = self.create_icon_from_svg(os.path.join(assets_dir, "converter_icon.svg"))
+            train_icon = self.create_icon_from_svg(os.path.join(icons_root, "train_icon.svg"))
+            test_icon = self.create_icon_from_svg(os.path.join(icons_root, "test_icon.svg"))
+            inference_icon = self.create_icon_from_svg(os.path.join(icons_root, "inference_icon.svg"))
+            annotation_icon = self.create_icon_from_svg(os.path.join(icons_root, "annotation_icon.svg"))
+            settings_icon = self.create_icon_from_svg(os.path.join(icons_root, "settings_icon.svg"))
+            converter_icon = self.create_icon_from_svg(os.path.join(icons_root, "converter_icon.svg"))
             
             self.tab_widget.setTabIcon(0, annotation_icon)
             self.tab_widget.setTabIcon(1, train_icon)

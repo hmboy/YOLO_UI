@@ -8,6 +8,7 @@ from utils.theme_manager import ThemeManager
 from utils.error_manager import ErrorManager
 from utils.shortcut_manager import ShortcutManager
 from utils.tooltip_manager import TooltipManager
+from utils.app_paths import data_dir
 
 # 在您的主程序开头添加（在导入 ultralytics 之前）
 os.environ["USE_FLASH_ATTN"] = "0"
@@ -17,9 +18,8 @@ def main():
         # 安装全局异常处理程序
         ErrorManager.install_global_handler()
         
-        # 确保数据目录存在
-        data_dir = os.path.join(os.path.dirname(__file__), 'data')
-        os.makedirs(data_dir, exist_ok=True)
+        # 确保数据目录存在（exe 旁可写）
+        os.makedirs(data_dir(), exist_ok=True)
         
         # 创建应用程序
         app = QApplication(sys.argv)
@@ -31,8 +31,6 @@ def main():
         
         # 显示启动画面
         splash = showSplashScreen(app, window)
-        
-   
         
         # 设置快捷键
         shortcut_manager = ShortcutManager(window)
@@ -64,4 +62,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -8,6 +8,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication
 from utils.theme_manager import ThemeManager
+from utils.app_paths import data_dir
 
 class SettingsTab(QWidget):
     """Tab for application settings and preferences."""
@@ -53,7 +54,7 @@ class SettingsTab(QWidget):
         }
         
         # Load settings if available
-        self.settings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'settings.json')
+        self.settings_file = os.path.join(data_dir(), 'settings.json')
         self.load_settings_from_file()
 
         # Set up UI

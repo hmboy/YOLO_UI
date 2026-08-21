@@ -85,14 +85,34 @@ class AnnotationTab(QWidget):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel('筛选:'))
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems([
-            '全部', '已标注', '未标注', '有检测',
-            '训练', '验证', '仅标注', '未分配',
-        ])
-        filter_layout.addWidget(self.filter_combo)
+        filter_layout = QVBoxLayout()
+        filter_top = QHBoxLayout()
+        filter_top.addWidget(QLabel('筛选:'))
+        self.filter_logic_combo = QComboBox()
+        self.filter_logic_combo.addItems(['与', '或'])
+        self.filter_logic_combo.setToolTip(
+            '与：同时满足下方所有非「全部」条件\n'
+            '或：满足任一非「全部」条件即可'
+        )
+        self.filter_logic_combo.setMaximumWidth(100)
+        filter_top.addWidget(self.filter_logic_combo)
+        filter_top.addStretch(1)
+        filter_layout.addLayout(filter_top)
+
+        filter_conds = QHBoxLayout()
+        self.filter_status_combo = QComboBox()
+        self.filter_status_combo.addItems(['状态:全部', '已标注', '未标注'])
+        self.filter_status_combo.setToolTip('标注状态')
+        self.filter_detect_combo = QComboBox()
+        self.filter_detect_combo.addItems(['检测:全部', '有检测', '无检测'])
+        self.filter_detect_combo.setToolTip('是否有检测结果')
+        self.filter_split_combo = QComboBox()
+        self.filter_split_combo.addItems(['划分:全部', '训练', '验证', '仅标注', '未分配'])
+        self.filter_split_combo.setToolTip('数据划分')
+        filter_conds.addWidget(self.filter_status_combo)
+        filter_conds.addWidget(self.filter_detect_combo)
+        filter_conds.addWidget(self.filter_split_combo)
+        filter_layout.addLayout(filter_conds)
         left_layout.addLayout(filter_layout)
 
         self.image_list = QListWidget()
@@ -448,7 +468,10 @@ class AnnotationTab(QWidget):
         self.prev_btn.clicked.connect(self.prev_image)
         self.next_btn.clicked.connect(self.next_image)
         self.image_list.currentRowChanged.connect(self.on_image_selected)
-        self.filter_combo.currentIndexChanged.connect(self.refresh_image_list)
+        self.filter_logic_combo.currentIndexChanged.connect(self.refresh_image_list)
+        self.filter_status_combo.currentIndexChanged.connect(self.refresh_image_list)
+        self.filter_detect_combo.currentIndexChanged.connect(self.refresh_image_list)
+        self.filter_split_combo.currentIndexChanged.connect(self.refresh_image_list)
         self.class_combo.currentIndexChanged.connect(self.on_class_changed)
         self.add_class_btn.clicked.connect(self.add_class)
         self.rename_class_btn.clicked.connect(self.rename_class)
@@ -953,30 +976,55 @@ class AnnotationTab(QWidget):
         self.class_combo.blockSignals(False)
         self.update_stats()
 
+    def _image_matches_filters(self, path: str) -> bool:
+        """按状态/检测/划分条件，结合与或逻辑判断是否显示。"""
+        annotated = self.manager.is_annotated(path)
+        has_det = bool(self._detection_results.get(path))
+        split = self.manager.get_split(path) or ''
+
+        status_idx = self.filter_status_combo.currentIndex()
+        detect_idx = self.filter_detect_combo.currentIndex()
+        split_idx = self.filter_split_combo.currentIndex()
+        use_and = self.filter_logic_combo.currentIndex() == 0
+
+        checks = []
+        if status_idx == 1:  # 已标注
+            checks.append(annotated)
+        elif status_idx == 2:  # 未标注
+            checks.append(not annotated)
+
+        if detect_idx == 1:  # 有检测
+            checks.append(has_det)
+        elif detect_idx == 2:  # 无检测
+            checks.append(not has_det)
+
+        if split_idx == 1:
+            checks.append(split == 'train')
+        elif split_idx == 2:
+            checks.append(split == 'val')
+        elif split_idx == 3:
+            checks.append(split == 'mark')
+        elif split_idx == 4:
+            checks.append(not split)
+
+        if not checks:
+            return True
+        if use_and:
+            return all(checks)
+        return any(checks)
+
     def refresh_image_list(self):
         self.image_list.blockSignals(True)
         current_path = self.manager.current_image_path
         self.image_list.clear()
-        filter_mode = self.filter_combo.currentIndex()
         selected_rows = []
         for i, path in enumerate(self.manager.image_paths):
+            if not self._image_matches_filters(path):
+                continue
+
             annotated = self.manager.is_annotated(path)
             has_det = bool(self._detection_results.get(path))
             split = self.manager.get_split(path)
-            if filter_mode == 1 and not annotated:
-                continue
-            if filter_mode == 2 and annotated:
-                continue
-            if filter_mode == 3 and not has_det:
-                continue
-            if filter_mode == 4 and split != 'train':
-                continue
-            if filter_mode == 5 and split != 'val':
-                continue
-            if filter_mode == 6 and split != 'mark':
-                continue
-            if filter_mode == 7 and split:
-                continue
 
             name = os.path.basename(path)
             split_tag = {
@@ -1512,7 +1560,10 @@ class AnnotationTab(QWidget):
         self.pipeline_progress.setValue(100)
         self.pipeline_status.setText(f'完成: {detected_imgs} 张有检测 / {total_boxes} 框')
         self.show_det_check.setChecked(True)
-        self.filter_combo.setCurrentIndex(0)
+        self.filter_status_combo.setCurrentIndex(0)
+        self.filter_detect_combo.setCurrentIndex(0)
+        self.filter_split_combo.setCurrentIndex(0)
+        self.filter_logic_combo.setCurrentIndex(0)
         self.refresh_image_list()
         if self.manager.current_index >= 0:
             self.load_image_at(self.manager.current_index)
