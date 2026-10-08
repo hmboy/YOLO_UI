@@ -18,7 +18,8 @@ class DetectAllWorker(QObject):
                  conf_thresh: float = 0.25, iou_thresh: float = 0.45,
                  img_size: int = 640, output_dir: str = None,
                  class_names: List[str] = None,
-                 roi_enabled: bool = False, roi_norm: Optional[Tuple[float, float, float, float]] = None):
+                 roi_enabled: bool = False, roi_norm: Optional[Tuple[float, float, float, float]] = None,
+                 ignore_mask_enabled: bool = False, ignore_mask_polygons=None):
         super().__init__()
         self.model_path = model_path
         self.image_paths = list(image_paths)
@@ -32,6 +33,9 @@ class DetectAllWorker(QObject):
             self.roi_norm = tuple(float(v) for v in roi_norm)
         else:
             self.roi_norm = (0.0, 0.0, 1.0, 1.0)
+        from utils.ignore_mask import normalize_polygons
+        self.ignore_mask_polygons = normalize_polygons(ignore_mask_polygons or [])
+        self.ignore_mask_enabled = bool(ignore_mask_enabled) and bool(self.ignore_mask_polygons)
         self.should_stop = False
 
     def stop(self):
@@ -74,11 +78,16 @@ class DetectAllWorker(QObject):
 
             from ultralytics import YOLO
             import cv2
+            from utils.ignore_mask import apply_to_bgr
 
             self.log_update.emit(f'加载模型: {self.model_path}')
             model = YOLO(self.model_path)
 
             use_roi = self.roi_enabled and not self._roi_is_full_frame()
+            if self.ignore_mask_enabled:
+                self.log_update.emit(
+                    f'检测使用 Ignore Mask: {len(self.ignore_mask_polygons)} 个多边形'
+                )
             if use_roi:
                 x1, y1, x2, y2 = self.roi_norm
                 self.log_update.emit(
@@ -103,6 +112,9 @@ class DetectAllWorker(QObject):
                         self.log_update.emit(f'  跳过无法读取的图像')
                         results_map[img_path] = []
                         continue
+
+                    if self.ignore_mask_enabled:
+                        apply_to_bgr(img, self.ignore_mask_polygons, (0, 0, 0))
 
                     source, ox, oy = self._crop_roi(img)
                     preds = model.predict(

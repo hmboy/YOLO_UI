@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QMenu, QAction,
 )
 from PyQt5.QtCore import Qt, QRectF, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QPen, QColor, QBrush, QPainter, QWheelEvent, QMouseEvent
+from PyQt5.QtGui import QPixmap, QPen, QColor, QBrush, QPainter, QWheelEvent, QMouseEvent, QPalette
 
 
 class _RoiTempRect(QGraphicsRectItem):
@@ -247,13 +247,17 @@ class RoiPickerDialog(QDialog):
         info_layout.addLayout(form)
 
         self.norm_label = QLabel('归一化: 未框选')
-        self.norm_label.setStyleSheet('color: gray;')
+        muted = self.palette().color(QPalette.Disabled, QPalette.WindowText).name()
+        self.norm_label.setStyleSheet(f'color: {muted};')
         info_layout.addWidget(self.norm_label)
         layout.addWidget(info)
 
         btn_row = QHBoxLayout()
         clear_btn = QPushButton('清除框选')
         clear_btn.clicked.connect(self._clear)
+        full_btn = QPushButton('设为全图')
+        full_btn.setToolTip('将 ROI 设为整张图像 (0,0)–(1,1)，训练时不裁剪')
+        full_btn.clicked.connect(self._set_full)
         apply_btn = QPushButton('应用输入')
         apply_btn.setToolTip('将下方手动输入的像素值应用到画布')
         apply_btn.clicked.connect(self._apply_spins)
@@ -262,6 +266,7 @@ class RoiPickerDialog(QDialog):
         cancel_btn = QPushButton('取消')
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(clear_btn)
+        btn_row.addWidget(full_btn)
         btn_row.addWidget(apply_btn)
         btn_row.addStretch()
         btn_row.addWidget(cancel_btn)
@@ -391,6 +396,15 @@ class RoiPickerDialog(QDialog):
 
     def _clear(self):
         self.canvas.clear_roi()
+        self._sync_spins_from_canvas()
+
+    def _set_full(self):
+        if self.canvas.image_width <= 0 or self.canvas.image_height <= 0:
+            QMessageBox.information(self, '提示', '请先选择样例图。')
+            return
+        self.canvas.set_roi_pixel(
+            0, 0, self.canvas.image_width, self.canvas.image_height
+        )
         self._sync_spins_from_canvas()
 
     def _accept(self):

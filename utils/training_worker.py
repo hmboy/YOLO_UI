@@ -23,7 +23,8 @@ class TrainingWorker(QObject):
                  model_weights=None, fine_tuning=False,
                  train_labels_dir=None, val_labels_dir=None,
                  use_gpu=True, gpu_device=0, export_onnx=True,
-                 roi_enabled=False, roi_norm=None):
+                 roi_enabled=False, roi_norm=None,
+                 ignore_mask_enabled=False, ignore_mask_polygons=None):
         """
         Initialize the training worker with parameters.
         
@@ -44,6 +45,8 @@ class TrainingWorker(QObject):
             export_onnx (bool): Whether to export ONNX after training
             roi_enabled (bool): Whether to crop all images with a global ROI before training
             roi_norm (tuple|list|None): Normalized ROI (x1, y1, x2, y2) in 0-1
+            ignore_mask_enabled (bool): Burn project-level ignore polygons before training
+            ignore_mask_polygons (list|None): Normalized polygons [[(x,y),...], ...]
         """
         super().__init__()
         self.model_type = model_type
@@ -69,6 +72,9 @@ class TrainingWorker(QObject):
             self.roi_norm = tuple(float(v) for v in roi_norm)
         else:
             self.roi_norm = (0.0, 0.0, 1.0, 1.0)
+        from utils.ignore_mask import normalize_polygons
+        self.ignore_mask_polygons = normalize_polygons(ignore_mask_polygons or [])
+        self.ignore_mask_enabled = bool(ignore_mask_enabled) and bool(self.ignore_mask_polygons)
 
         self._stop_event = threading.Event()
         self._trainer_ref = None  # Reference to the trainer object for direct access
@@ -124,6 +130,10 @@ class TrainingWorker(QObject):
             if self.roi_enabled and not self._roi_is_full_frame():
                 x1, y1, x2, y2 = self.roi_norm
                 self.log_update.emit(f"Global ROI: ({x1:.4f}, {y1:.4f}) -> ({x2:.4f}, {y2:.4f})")
+            if self.ignore_mask_enabled:
+                self.log_update.emit(
+                    f"Ignore mask: {len(self.ignore_mask_polygons)} polygon(s), burn before train"
+                )
             
             # Check internet connectivity for model downloading
             has_internet = self._check_internet_connection()
@@ -175,6 +185,7 @@ class TrainingWorker(QObject):
                     self.model_weights = None
             
             # 全局 ROI：训练前物化裁剪数据集，并对标签坐标重映射
+            self._apply_ignore_mask_if_needed()
             self._apply_global_roi_if_needed()
 
             # Create data.yaml file based on dataset format
@@ -1225,7 +1236,8 @@ class TrainingWorker(QObject):
         return yaml_path
 
     def _cache_fingerprint(self) -> str:
-        """缓存指纹：包含图像/标签目录与 ROI，避免变更后误用旧 yaml。"""
+        """缓存指纹：包含图像/标签目录与 ROI / ignore mask，避免变更后误用旧 yaml。"""
+        from utils.ignore_mask import fingerprint as mask_fp
         roi = self.roi_norm if self.roi_enabled else (0.0, 0.0, 1.0, 1.0)
         return '\n'.join([
             self.train_dir or '',
@@ -1235,6 +1247,8 @@ class TrainingWorker(QObject):
             self.dataset_format or '',
             f'roi_enabled={int(bool(self.roi_enabled))}',
             f'roi={roi[0]:.6f},{roi[1]:.6f},{roi[2]:.6f},{roi[3]:.6f}',
+            f'ignore_mask={int(bool(self.ignore_mask_enabled))}',
+            f'ignore_mask_fp={mask_fp(self.ignore_mask_polygons) if self.ignore_mask_enabled else ""}',
         ])
 
     def _roi_is_full_frame(self) -> bool:
@@ -1391,6 +1405,99 @@ class TrainingWorker(QObject):
                 self.log_update.emit(f'ROI 裁剪进度: {idx + 1}/{total}')
         return count
 
+    def _burn_ignore_mask_split(self, images_dir: str, labels_dir: str,
+                                out_images: str, out_labels: str) -> int:
+        """复制 split 并将 ignore 多边形涂黑，标签原样拷贝。"""
+        import cv2
+        import shutil
+        from utils.ignore_mask import apply_to_bgr
+
+        os.makedirs(out_images, exist_ok=True)
+        os.makedirs(out_labels, exist_ok=True)
+        count = 0
+        images = self._list_image_files(images_dir)
+        total = len(images)
+        for idx, img_path in enumerate(images):
+            if self._stop_event.is_set():
+                raise RuntimeError('训练已停止')
+            img = cv2.imread(img_path)
+            if img is None:
+                self.log_update.emit(f'跳过无法读取的图像: {img_path}')
+                continue
+            apply_to_bgr(img, self.ignore_mask_polygons, (0, 0, 0))
+            fname = os.path.basename(img_path)
+            stem = os.path.splitext(fname)[0]
+            out_img = os.path.join(out_images, fname)
+            if not cv2.imwrite(out_img, img):
+                out_img = os.path.join(out_images, stem + '.png')
+                cv2.imwrite(out_img, img)
+
+            src_label = os.path.join(labels_dir, stem + '.txt')
+            out_label = os.path.join(out_labels, stem + '.txt')
+            if os.path.isfile(src_label):
+                shutil.copy2(src_label, out_label)
+            else:
+                open(out_label, 'w', encoding='utf-8').close()
+
+            count += 1
+            if total and (idx + 1) % max(1, total // 10) == 0:
+                self.log_update.emit(f'Ignore mask 进度: {idx + 1}/{total}')
+        return count
+
+    def _apply_ignore_mask_if_needed(self):
+        """启用 ignore mask 时生成涂黑数据集，再交给后续 ROI 裁剪。"""
+        if not self.ignore_mask_enabled:
+            return
+
+        self.log_update.emit(
+            f'启用 Ignore Mask 涂黑: {len(self.ignore_mask_polygons)} 个多边形'
+        )
+        train_img = self._resolve_image_dir(self.train_dir, '训练集')
+        val_img = self._resolve_image_dir(self.val_dir, '验证集')
+        if not os.path.isdir(val_img) or not self._has_images(val_img):
+            val_img = train_img
+
+        train_lbl = self._guess_labels_dir(train_img, self.train_labels_dir)
+        val_lbl = self._guess_labels_dir(val_img, self.val_labels_dir)
+
+        out_root = os.path.join(self.output_dir, 'datasets', 'ignore_masked')
+        import shutil
+        if os.path.isdir(out_root):
+            shutil.rmtree(out_root, ignore_errors=True)
+
+        train_out_img = os.path.join(out_root, 'images', 'train')
+        train_out_lbl = os.path.join(out_root, 'labels', 'train')
+        val_out_img = os.path.join(out_root, 'images', 'val')
+        val_out_lbl = os.path.join(out_root, 'labels', 'val')
+
+        n_train = self._burn_ignore_mask_split(
+            train_img, train_lbl, train_out_img, train_out_lbl
+        )
+        if n_train <= 0:
+            raise RuntimeError('Ignore mask 处理后训练集为空')
+
+        same_val = os.path.normpath(val_img) == os.path.normpath(train_img)
+        if same_val:
+            val_out_img = train_out_img
+            val_out_lbl = train_out_lbl
+            self.log_update.emit('验证集与训练集相同，复用 mask 结果')
+        else:
+            n_val = self._burn_ignore_mask_split(
+                val_img, val_lbl, val_out_img, val_out_lbl
+            )
+            if n_val <= 0:
+                self.log_update.emit('Ignore mask 后验证集为空，改用训练集')
+                val_out_img = train_out_img
+                val_out_lbl = train_out_lbl
+
+        self.train_dir = train_out_img
+        self.val_dir = val_out_img
+        self.train_labels_dir = train_out_lbl
+        self.val_labels_dir = val_out_lbl
+        self.log_update.emit(
+            f'Ignore mask 完成: train={n_train} → {train_out_img}'
+        )
+
     def _apply_global_roi_if_needed(self):
         """若启用全局 ROI，生成裁剪数据集并切换 train/val 目录。"""
         if not self.roi_enabled or self._roi_is_full_frame():
@@ -1454,9 +1561,37 @@ class TrainingWorker(QObject):
         self.val_dir = val_out_img
         self.train_labels_dir = train_out_lbl
         self.val_labels_dir = val_out_lbl
+
+        train_inst = self._count_label_file_instances(train_out_lbl)
+        val_inst = self._count_label_file_instances(val_out_lbl)
+        if train_inst < 1:
+            raise RuntimeError(
+                'ROI 裁剪后训练集标签全被裁掉了。请放大 ROI，或关闭 ROI 后重训。'
+            )
+        if val_inst < 1:
+            self.log_update.emit('ROI 裁剪后验证集无有效标签，改用训练集做验证')
+            self.val_dir = train_out_img
+            self.val_labels_dir = train_out_lbl
+            val_inst = train_inst
+
         self.log_update.emit(
-            f'ROI 裁剪完成: train={n_train} val={n_val if not same_val else n_train} → {out_root}'
+            f'ROI 裁剪完成: train={n_train}张/{train_inst}框 '
+            f'val={n_val if not same_val else n_train}张/{val_inst}框 → {out_root}'
         )
+
+    def _count_label_file_instances(self, labels_dir: str) -> int:
+        if not labels_dir or not os.path.isdir(labels_dir):
+            return 0
+        n = 0
+        for name in os.listdir(labels_dir):
+            if not name.endswith('.txt'):
+                continue
+            try:
+                with open(os.path.join(labels_dir, name), 'r', encoding='utf-8') as f:
+                    n += sum(1 for line in f if line.strip())
+            except OSError:
+                continue
+        return n
 
     def _update_paths_in_yaml(self, src_yaml, dst_yaml):
         """更新YAML文件中的路径以适应当前环境"""

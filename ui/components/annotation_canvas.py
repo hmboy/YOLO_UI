@@ -211,6 +211,22 @@ class DetectionItem(QGraphicsRectItem):
         painter.drawRect(self.rect())
 
 
+class IgnoreMaskOverlayItem(QGraphicsPolygonItem):
+    """只读 ignore mask 预览，不抢鼠标。"""
+
+    def __init__(self, polygon: QPolygonF):
+        super().__init__(polygon)
+        self.setZValue(0.5)
+        self.setFlag(QGraphicsPolygonItem.ItemIsSelectable, False)
+        self.setFlag(QGraphicsPolygonItem.ItemIsMovable, False)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        pen = QPen(QColor('#FF6D00'), 2, Qt.DashLine)
+        self.setPen(pen)
+        fill = QColor('#FF6D00')
+        fill.setAlpha(70)
+        self.setBrush(QBrush(fill))
+
+
 class AnnotationCanvas(QGraphicsView):
     """图像标注画布：矩形框 / 多边形、缩放、平移、全屏。"""
 
@@ -237,20 +253,22 @@ class AnnotationCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setBackgroundBrush(QBrush(QColor('#2b2b2b')))
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setOptimizationFlags(QGraphicsView.DontSavePainterState)
         self.setCacheMode(QGraphicsView.CacheNone)
-        self.setStyleSheet('QGraphicsView { border: none; background: #2b2b2b; }')
         self.viewport().setAutoFillBackground(False)
         self.scene.setBackgroundBrush(QBrush(Qt.NoBrush))
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.apply_theme()
 
         self.manager: AnnotationManager = None
         self.pixmap_item: QGraphicsPixmapItem = None
         self.box_items: list = []
         self.detection_items: list = []
+        self._ignore_mask_items: list = []
+        self._ignore_mask_polygons = []  # full-image normalized
+        self._ignore_mask_visible = False
         self.image_path: str = None
         self.image_width = 0
         self.image_height = 0
@@ -278,6 +296,12 @@ class AnnotationCanvas(QGraphicsView):
         self._pan_last_pos = QPoint()
         self._space_pressed = False
 
+        self._undo_stack = []  # list[list[Annotation]]
+        self._applying_undo = False
+        self._drag_item = None
+        self._drag_start_pos = None
+        self._undo_before_drag = None
+
         self._fs_dialog = None
         self._pre_fs_parent = None
         self._pre_fs_layout = None
@@ -295,6 +319,14 @@ class AnnotationCanvas(QGraphicsView):
 
     def set_manager(self, manager: AnnotationManager) -> None:
         self.manager = manager
+
+    def apply_theme(self) -> None:
+        """画布底色随应用主题：浅色用浅灰，深色/科技用深灰。"""
+        app = QApplication.instance()
+        theme = app.property('theme') if app is not None else 'dark'
+        bg = '#e8e8ea' if theme == 'light' else '#2b2b2b'
+        self.setBackgroundBrush(QBrush(QColor(bg)))
+        self.setStyleSheet(f'QGraphicsView {{ border: none; background: {bg}; }}')
 
     def set_split_badge(self, split: str) -> None:
         """在图像上显示划分：train/val/mark/空。"""
@@ -446,16 +478,28 @@ class AnnotationCanvas(QGraphicsView):
         )
 
     def load_image(self, image_path: str, boxes: list, detections: list = None) -> None:
+        # 切图时保留当前缩放与视口中心（相对比例）
+        keep_view = bool(self.pixmap_item) and self.image_width > 0 and self.image_height > 0
+        old_zoom = self.current_zoom() if keep_view else 0.0
+        old_center = self.mapToScene(self.viewport().rect().center()) if keep_view else None
+        old_w = self.image_width
+        old_h = self.image_height
+
         self.image_path = image_path
         self.scene.clear()
         self.box_items.clear()
         self.detection_items.clear()
+        self._ignore_mask_items.clear()
         self.temp_rect = None
         self._temp_poly = None
         self.drawing = False
         self._poly_drawing = False
         self._poly_points = []
         self._panning = False
+        self._undo_stack.clear()
+        self._drag_item = None
+        self._drag_start_pos = None
+        self._undo_before_drag = None
 
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
@@ -494,13 +538,60 @@ class AnnotationCanvas(QGraphicsView):
         if detections and self.show_detections:
             self.set_detections(detections, clear_existing=False)
 
-        self.reset_view()
-        QTimer.singleShot(0, self.reset_view)
+        self._redraw_ignore_mask()
+
+        if keep_view and old_zoom > 0:
+            self._restore_view(old_zoom, old_center, old_w, old_h)
+        else:
+            self.reset_view()
+            QTimer.singleShot(0, self.reset_view)
+
         # 恢复划分角标（scene.clear 不影响 viewport 上的 QLabel）
         if self.manager and self.image_path:
             self.set_split_badge(self.manager.get_split(self.image_path))
         else:
             self.set_split_badge('')
+
+    def _restore_view(self, zoom: float, old_center, old_w: int, old_h: int) -> None:
+        """按上一张的缩放与相对中心恢复视口。"""
+        zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(zoom)))
+        self.resetTransform()
+        self.scale(zoom, zoom)
+        if old_center is not None and old_w > 0 and old_h > 0:
+            nx = old_center.x() / old_w
+            ny = old_center.y() / old_h
+            self.centerOn(QPointF(nx * self.image_width, ny * self.image_height))
+        else:
+            self.centerOn(self.scene.sceneRect().center())
+
+    def set_ignore_mask(self, polygons, visible: bool = True) -> None:
+        """设置全图归一化 ignore 多边形预览；visible=False 时隐藏。"""
+        from utils.ignore_mask import normalize_polygons
+        self._ignore_mask_polygons = normalize_polygons(polygons or [])
+        self._ignore_mask_visible = bool(visible) and bool(self._ignore_mask_polygons)
+        self._redraw_ignore_mask()
+
+    def _redraw_ignore_mask(self) -> None:
+        for item in self._ignore_mask_items:
+            if item.scene() is self.scene:
+                self.scene.removeItem(item)
+        self._ignore_mask_items.clear()
+        if not self._ignore_mask_visible or self.image_width <= 0 or self.image_height <= 0:
+            return
+        fw = self.full_image_width or self.image_width
+        fh = self.full_image_height or self.image_height
+        ox, oy = self.roi_offset_x, self.roi_offset_y
+        for poly in self._ignore_mask_polygons:
+            pts = []
+            for nx, ny in poly:
+                px = nx * fw - ox
+                py = ny * fh - oy
+                pts.append(QPointF(px, py))
+            if len(pts) < 3:
+                continue
+            item = IgnoreMaskOverlayItem(QPolygonF(pts))
+            self.scene.addItem(item)
+            self._ignore_mask_items.append(item)
 
     def set_detections(self, detections: list, clear_existing: bool = True) -> None:
         if clear_existing:
@@ -585,10 +676,29 @@ class AnnotationCanvas(QGraphicsView):
                 item.setZValue(1)
         self.boxes_changed.emit()
 
+    def _push_undo(self) -> None:
+        if self._applying_undo:
+            return
+        self._undo_stack.append(self.get_boxes())
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+
+    def undo(self) -> bool:
+        if not self._undo_stack:
+            return False
+        snap = self._undo_stack.pop()
+        self._applying_undo = True
+        try:
+            self.set_boxes(snap)
+        finally:
+            self._applying_undo = False
+        return True
+
     def delete_selected(self) -> bool:
         selected = [item for item in self.box_items if item.isSelected()]
         if not selected:
             return False
+        self._push_undo()
         for item in selected:
             self.scene.removeItem(item)
             self.box_items.remove(item)
@@ -600,16 +710,20 @@ class AnnotationCanvas(QGraphicsView):
         for item in self.box_items:
             item.setSelected(item is target)
         if target is not None:
+            max_z = max((i.zValue() for i in self.box_items), default=1) + 1
+            target.setZValue(max_z)
             self.box_selected.emit(self.box_items.index(target) if target in self.box_items else -1)
 
-    def _ann_item_at(self, view_pos: QPoint):
-        """在点击位置附近查找标注项（优先整框命中，其次扩大搜索半径）。"""
+    def _ann_items_at(self, view_pos: QPoint) -> list:
+        """点击处全部标注，自上而下。"""
         scene_pos = self.mapToScene(view_pos)
+        found = []
         for item in self.scene.items(scene_pos):
             if getattr(item, 'kind', None) in ('bbox', 'polygon') and item in self.box_items:
-                return item
+                found.append(item)
+        if found:
+            return found
 
-        # 放大搜索：按屏幕像素半径找附近标注，缩放小时也易选中
         radius = 14
         search = self.mapToScene(
             view_pos.x() - radius, view_pos.y() - radius,
@@ -622,21 +736,30 @@ class AnnotationCanvas(QGraphicsView):
                 cx, cy = br.center().x(), br.center().y()
                 dist = (cx - scene_pos.x()) ** 2 + (cy - scene_pos.y()) ** 2
                 candidates.append((dist, item))
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
-        return None
+        candidates.sort(key=lambda x: x[0])
+        return [item for _, item in candidates]
+
+    def _ann_item_at(self, view_pos: QPoint, cycle: bool = False):
+        """查找标注；cycle=True 时在重叠项间轮转。"""
+        items = self._ann_items_at(view_pos)
+        if not items:
+            return None
+        if cycle and len(items) > 1:
+            cur = next((i for i in items if i.isSelected()), None)
+            if cur is not None:
+                return items[(items.index(cur) + 1) % len(items)]
+        return items[0]
 
     def change_selected_class(self, class_id: int) -> None:
-        changed = False
-        for item in self.box_items:
-            if item.isSelected():
-                item.class_id = class_id
-                color = self.manager.class_color(class_id) if self.manager else '#FF3838'
-                item.update_color(color)
-                changed = True
-        if changed:
-            self.boxes_changed.emit()
+        selected = [item for item in self.box_items if item.isSelected()]
+        if not selected:
+            return
+        self._push_undo()
+        for item in selected:
+            item.class_id = class_id
+            color = self.manager.class_color(class_id) if self.manager else '#FF3838'
+            item.update_color(color)
+        self.boxes_changed.emit()
 
     def _cancel_polygon(self) -> None:
         if self._temp_poly is not None:
@@ -654,6 +777,7 @@ class AnnotationCanvas(QGraphicsView):
             self.image_width, self.image_height
         )
         self._cancel_polygon()
+        self._push_undo()
         item = self._add_ann_item(poly, len(self.box_items))
         if item:
             item.setZValue(1)
@@ -712,18 +836,24 @@ class AnnotationCanvas(QGraphicsView):
 
         if event.button() == Qt.LeftButton and self.mode == self.MODE_DRAW and self.pixmap_item and not self._space_pressed:
             # 正在画多边形时继续加点，不切换选中
-            if not self._poly_drawing:
-                hit = self._ann_item_at(event.pos())
+            # Shift：叠在已有标注上强制新建
+            if not self._poly_drawing and not (event.modifiers() & Qt.ShiftModifier):
+                cycle = bool(event.modifiers() & Qt.AltModifier)
+                hit = self._ann_item_at(event.pos(), cycle=cycle)
                 if hit is not None:
-                    # 点到已有标注：选中/拖动，而不是新建
                     modifiers = event.modifiers()
                     if modifiers & Qt.ControlModifier:
                         hit.setSelected(not hit.isSelected())
+                        self._drag_item = None
                     else:
+                        self._undo_before_drag = self.get_boxes()
+                        self._drag_item = hit
+                        self._drag_start_pos = QPointF(hit.pos())
                         self.select_only(hit)
                     super().mousePressEvent(event)
                     event.accept()
                     return
+                self._drag_item = None
 
             scene_pos = self._clamp_scene_pos(self.mapToScene(event.pos()))
             if not self.scene.sceneRect().contains(scene_pos):
@@ -793,11 +923,24 @@ class AnnotationCanvas(QGraphicsView):
                     self.current_class_id, x1, y1, x2, y2,
                     self.image_width, self.image_height
                 )
+                self._push_undo()
                 item = self._add_box_item(box, len(self.box_items))
                 item.setZValue(1)
                 self.boxes_changed.emit()
             event.accept()
             return
+
+        if event.button() == Qt.LeftButton and self._drag_item is not None:
+            moved = self._drag_start_pos is not None and self._drag_item.pos() != self._drag_start_pos
+            if moved and self._undo_before_drag is not None and not self._applying_undo:
+                self._undo_stack.append(self._undo_before_drag)
+                if len(self._undo_stack) > 50:
+                    self._undo_stack.pop(0)
+                self.boxes_changed.emit()
+            self._drag_item = None
+            self._drag_start_pos = None
+            self._undo_before_drag = None
+
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -866,6 +1009,10 @@ class AnnotationCanvas(QGraphicsView):
             self.delete_selected()
             event.accept()
             return
+        if event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+            if self.undo():
+                event.accept()
+                return
         if event.key() in (Qt.Key_Plus, Qt.Key_Equal) and event.modifiers() & Qt.ControlModifier:
             self.zoom_in()
             event.accept()
